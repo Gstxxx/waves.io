@@ -1,0 +1,257 @@
+/**
+ * Controls Module
+ * Handles user input, raycasting, and brush application
+ */
+
+import * as THREE from 'three';
+import { TerrainSystem } from './terrain';
+import { BrushConfig, applyBrush } from './brushes';
+
+export interface ControlsState {
+  isPointerDown: boolean;
+  pointerPosition: THREE.Vector2;
+  brushPosition: THREE.Vector3 | null;
+  isOverTerrain: boolean;
+}
+
+export class TerrainControls {
+  private terrain: TerrainSystem;
+  private camera: THREE.Camera;
+  private domElement: HTMLElement;
+  private raycaster: THREE.Raycaster;
+  
+  public state: ControlsState;
+  public brushConfig: BrushConfig;
+  public brushIndicator: THREE.Mesh;
+  
+  private onBrushApplied?: () => void;
+
+  constructor(
+    terrain: TerrainSystem,
+    camera: THREE.Camera,
+    domElement: HTMLElement,
+    initialBrushConfig: BrushConfig
+  ) {
+    this.terrain = terrain;
+    this.camera = camera;
+    this.domElement = domElement;
+    this.raycaster = new THREE.Raycaster();
+    
+    this.brushConfig = { ...initialBrushConfig };
+    
+    this.state = {
+      isPointerDown: false,
+      pointerPosition: new THREE.Vector2(),
+      brushPosition: null,
+      isOverTerrain: false,
+    };
+    
+    // Create brush indicator
+    this.brushIndicator = this.createBrushIndicator();
+    
+    // Bind event handlers
+    this.handlePointerMove = this.handlePointerMove.bind(this);
+    this.handlePointerDown = this.handlePointerDown.bind(this);
+    this.handlePointerUp = this.handlePointerUp.bind(this);
+    
+    this.attachEventListeners();
+  }
+
+  /**
+   * Creates a visual indicator for the brush
+   */
+  private createBrushIndicator(): THREE.Mesh {
+    const geometry = new THREE.RingGeometry(
+      this.brushConfig.radius * 0.9,
+      this.brushConfig.radius,
+      32
+    );
+    geometry.rotateX(-Math.PI / 2);
+    
+    const material = new THREE.MeshBasicMaterial({
+      color: '#ffffff',
+      transparent: true,
+      opacity: 0.5,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.visible = false;
+    
+    return mesh;
+  }
+
+  /**
+   * Updates brush indicator size
+   */
+  updateBrushIndicator(): void {
+    const oldGeometry = this.brushIndicator.geometry;
+    this.brushIndicator.geometry = new THREE.RingGeometry(
+      this.brushConfig.radius * 0.9,
+      this.brushConfig.radius,
+      32
+    );
+    this.brushIndicator.geometry.rotateX(-Math.PI / 2);
+    oldGeometry.dispose();
+  }
+
+  /**
+   * Attaches event listeners
+   */
+  private attachEventListeners(): void {
+    this.domElement.addEventListener('pointermove', this.handlePointerMove);
+    this.domElement.addEventListener('pointerdown', this.handlePointerDown);
+    this.domElement.addEventListener('pointerup', this.handlePointerUp);
+    this.domElement.addEventListener('pointerleave', this.handlePointerUp);
+  }
+
+  /**
+   * Handles pointer movement
+   */
+  private handlePointerMove(event: PointerEvent): void {
+    const rect = this.domElement.getBoundingClientRect();
+    this.state.pointerPosition.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    this.state.pointerPosition.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    
+    this.updateRaycast();
+    
+    // Apply brush while dragging
+    if (this.state.isPointerDown && this.state.brushPosition) {
+      this.applyBrushAtPosition();
+    }
+  }
+
+  /**
+   * Handles pointer down
+   */
+  private handlePointerDown(event: PointerEvent): void {
+    // Only respond to left click (primary button)
+    if (event.button !== 0) return;
+    
+    // Check if Ctrl or Shift is held (for camera controls)
+    if (event.ctrlKey || event.shiftKey || event.altKey) return;
+    
+    this.state.isPointerDown = true;
+    
+    if (this.state.brushPosition) {
+      this.applyBrushAtPosition();
+    }
+  }
+
+  /**
+   * Handles pointer up
+   */
+  private handlePointerUp(): void {
+    this.state.isPointerDown = false;
+  }
+
+  /**
+   * Updates raycast to terrain
+   */
+  private updateRaycast(): void {
+    this.raycaster.setFromCamera(this.state.pointerPosition, this.camera);
+    
+    const intersects = this.raycaster.intersectObject(this.terrain.mesh);
+    
+    if (intersects.length > 0) {
+      const point = intersects[0].point;
+      this.state.brushPosition = point.clone();
+      this.state.isOverTerrain = true;
+      
+      // Update brush indicator
+      this.brushIndicator.position.copy(point);
+      this.brushIndicator.position.y += 0.1; // Slight offset to prevent z-fighting
+      this.brushIndicator.visible = true;
+    } else {
+      this.state.brushPosition = null;
+      this.state.isOverTerrain = false;
+      this.brushIndicator.visible = false;
+    }
+  }
+
+  /**
+   * Applies brush at current position
+   */
+  private applyBrushAtPosition(): void {
+    if (!this.state.brushPosition) return;
+    
+    applyBrush(
+      this.terrain,
+      this.state.brushPosition.x,
+      this.state.brushPosition.z,
+      this.brushConfig
+    );
+    
+    // Update terrain uniforms
+    this.terrain.updateUniforms({});
+    
+    // Callback for vegetation regeneration, etc.
+    if (this.onBrushApplied) {
+      this.onBrushApplied();
+    }
+  }
+
+  /**
+   * Sets callback for when brush is applied
+   */
+  setOnBrushApplied(callback: () => void): void {
+    this.onBrushApplied = callback;
+  }
+
+  /**
+   * Updates camera reference (needed if camera changes)
+   */
+  setCamera(camera: THREE.Camera): void {
+    this.camera = camera;
+  }
+
+  /**
+   * Updates brush configuration
+   */
+  setBrushConfig(config: Partial<BrushConfig>): void {
+    this.brushConfig = { ...this.brushConfig, ...config };
+    this.updateBrushIndicator();
+    
+    // Update indicator color based on brush type
+    const material = this.brushIndicator.material as THREE.MeshBasicMaterial;
+    switch (this.brushConfig.type) {
+      case 'raise':
+        material.color.setHex(0x00ff00);
+        break;
+      case 'lower':
+        material.color.setHex(0xff0000);
+        break;
+      case 'smooth':
+        material.color.setHex(0x00ffff);
+        break;
+      case 'flatten':
+        material.color.setHex(0xffff00);
+        break;
+      case 'erosion':
+        material.color.setHex(0xff8800);
+        break;
+    }
+  }
+
+  /**
+   * Updates on each frame
+   */
+  update(): void {
+    // Continuous brush application could be throttled here
+  }
+
+  /**
+   * Cleans up event listeners
+   */
+  dispose(): void {
+    this.domElement.removeEventListener('pointermove', this.handlePointerMove);
+    this.domElement.removeEventListener('pointerdown', this.handlePointerDown);
+    this.domElement.removeEventListener('pointerup', this.handlePointerUp);
+    this.domElement.removeEventListener('pointerleave', this.handlePointerUp);
+    
+    this.brushIndicator.geometry.dispose();
+    (this.brushIndicator.material as THREE.Material).dispose();
+  }
+}
+

@@ -1,8 +1,10 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #0a0a0a;
+  --foreground: #ededed;
+  --accent: #4db8b8;
+  --sand: #c2b280;
 }
 
 @theme inline {
@@ -12,15 +14,184 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: 'Segoe UI', system-ui, sans-serif;
+}
+
+/* Simulator Container */
+.simulator-container {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: linear-gradient(135deg, #0a1628 0%, #1a2744 50%, #0d1f3c 100%);
+}
+
+.simulator-container canvas {
+  width: 100% !important;
+  height: 100% !important;
+  display: block;
+}
+
+/* Instructions Overlay */
+.instructions {
+  position: fixed;
+  bottom: 20px;
+  left: 20px;
+  background: rgba(10, 22, 40, 0.85);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(77, 184, 184, 0.3);
+  border-radius: 12px;
+  padding: 16px 20px;
+  color: #ededed;
+  font-size: 13px;
+  line-height: 1.6;
+  max-width: 320px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  z-index: 100;
+}
+
+.instructions h3 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 12px;
+  letter-spacing: 0.5px;
+}
+
+.instructions p {
+  margin: 6px 0;
+  color: rgba(237, 237, 237, 0.85);
+}
+
+.instructions p strong {
+  color: var(--sand);
+  font-weight: 500;
+}
+
+/* Leva Controls Styling */
+[class*="leva-"] {
+  --leva-colors-accent1: #4db8b8 !important;
+  --leva-colors-accent2: #3a9999 !important;
+  --leva-colors-accent3: #2d7a7a !important;
+  --leva-colors-highlight1: rgba(77, 184, 184, 0.1) !important;
+  --leva-colors-highlight2: rgba(77, 184, 184, 0.2) !important;
+  --leva-colors-highlight3: rgba(77, 184, 184, 0.3) !important;
+  font-family: 'Segoe UI', system-ui, sans-serif !important;
+}
+
+/* Loading Screen */
+.loading-screen {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: linear-gradient(135deg, #0a1628 0%, #1a2744 50%, #0d1f3c 100%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.loading-screen h1 {
+  font-size: 32px;
+  font-weight: 300;
+  color: var(--accent);
+  margin-bottom: 24px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+}
+
+.loading-spinner {
+  width: 48px;
+  height: 48px;
+  border: 3px solid rgba(77, 184, 184, 0.2);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* Title Bar */
+.title-bar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 48px;
+  background: rgba(10, 22, 40, 0.9);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid rgba(77, 184, 184, 0.2);
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  z-index: 100;
+}
+
+.title-bar h1 {
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--accent);
+  letter-spacing: 2px;
+}
+
+.title-bar span {
+  font-size: 12px;
+  color: rgba(237, 237, 237, 0.5);
+  margin-left: 12px;
+  font-weight: 400;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .instructions {
+    bottom: 10px;
+    left: 10px;
+    right: 10px;
+    max-width: none;
+    font-size: 12px;
+    padding: 12px 16px;
+  }
+  
+  .instructions h3 {
+    font-size: 14px;
+  }
+}
+
+/* Hide scrollbars but allow scrolling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(10, 22, 40, 0.5);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(77, 184, 184, 0.4);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(77, 184, 184, 0.6);
 }
