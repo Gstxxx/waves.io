@@ -47,6 +47,13 @@ varying float vShoreWash;
 varying float vTerrainDepth; // NEW: actual depth to terrain
 varying float vDepthNormalized; // NEW: normalized depth for colors
 
+// Physical constants for shallow-water physics
+const float SHALLOW_MIN_DEPTH = 0.5;
+const float SHALLOW_MAX_DEPTH = 5.0;
+const float INTERSECTION_MIN_DEPTH = 0.0;
+const float INTERSECTION_MAX_DEPTH = 0.5;
+const float NORMAL_EPSILON = 0.02; // For derivative calculation (smaller = sharper normals, more detail)
+
 // Enhanced noise functions for organic variation
 float hash(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
@@ -79,25 +86,24 @@ float fbm(vec2 p) {
 }
 
 // Sample terrain height from REAL heightmap texture
-// This is the KEY - water now sees the actual terrain!
-float sampleTerrainHeight(vec2 worldPos) {
-  // Convert world position to UV coordinates (0-1 range)
-  // World position is centered at origin, so we offset by half size
-  vec2 terrainUV = (worldPos / terrainSize) + 0.5;
+// Heightmap stores world units directly (no normalization needed)
+// chunkOrigin: offset for future chunk system (use vec2(0.0) for current system)
+float sampleTerrainHeight(vec2 worldPos, vec2 chunkOrigin) {
+  // Calculate relative position from chunk origin
+  vec2 relativePos = worldPos - chunkOrigin;
   
-  // Clamp to valid texture range
+  // Convert to UV coordinates (0-1 range)
+  // World position is centered at origin, so we offset by half size
+  vec2 terrainUV = (relativePos / terrainSize) + 0.5;
+  
+  // Critical: Clamp BEFORE sampling to prevent out-of-bounds
   terrainUV = clamp(terrainUV, 0.0, 1.0);
   
-  // Sample heightmap texture (normalized 0-1, needs denormalization)
-  float normalizedHeight = texture2D(terrainHeightMap, terrainUV).r;
+  // Future chunk system (commented for now):
+  // terrainUV.x += chunkIndex.x * chunkUVSize;
   
-  // Denormalize: heightmap stores 0-1, we need actual height range
-  // Assuming terrain height range is -5 to 15 (20 units total)
-  float minHeight = -5.0;
-  float maxHeight = 15.0;
-  float heightRange = maxHeight - minHeight;
-  
-  float terrainHeight = minHeight + normalizedHeight * heightRange;
+  // Sample heightmap texture - returns world units directly
+  float terrainHeight = texture2D(terrainHeightMap, terrainUV).r;
   
   return terrainHeight;
 }
@@ -142,16 +148,130 @@ float wavePatch(vec2 pos, vec2 center, float time, float speed, float size) {
   return wave * falloff;
 }
 
+// Shallow-water physics: attenuate wave amplitude based on depth
+// Uses smoothstep for smooth transition from shallow to deep water
+float shallowWaterAttenuation(float depth) {
+  float d = max(depth, 0.0); // Clamp to avoid negative values from precision
+  return smoothstep(SHALLOW_MIN_DEPTH, SHALLOW_MAX_DEPTH, d);
+}
+
+// UNIFIED WAVE DISPLACEMENT FUNCTION
+// This is the single source of truth for wave calculations
+// Used both in main() and normal calculation to ensure mathematical consistency
+// Returns vec3 displacement (x, y, z) from the base position
+vec3 computeWaveDisplacement(
+  vec2 xzPos,
+  float terrainHeight,
+  float actualDepth,
+  float depthNormalized,
+  bool isDry,
+  float t,
+  vec2 toCenter,
+  float waveStrength
+) {
+  vec3 displacement = vec3(0.0);
+  
+  // If dry, return zero displacement
+  float dryFactor = isDry ? 0.0 : 1.0;
+  if (isDry || actualDepth <= 0.5) {
+    return displacement;
+  }
+  
+  // Apply shallow-water physics attenuation
+  float attenuation = shallowWaterAttenuation(actualDepth);
+  float deepWaveMultiplier = mix(0.2, 1.0, depthNormalized);
+  float swellAttenuation = attenuation * dryFactor;
+  
+  // Large swells
+  vec3 swell1 = organicWave(xzPos, waveStrength * 0.6 * deepWaveMultiplier * swellAttenuation, 35.0, toCenter, t, 0.0, actualDepth);
+  vec3 swell2 = organicWave(xzPos, waveStrength * 0.4 * deepWaveMultiplier * swellAttenuation, 28.0, toCenter + vec2(0.5, -0.3), t * 1.13, 3.7, actualDepth);
+  vec3 swell3 = organicWave(xzPos, waveStrength * 0.35 * deepWaveMultiplier * swellAttenuation, 22.0, toCenter + vec2(-0.4, 0.6), t * 0.87, 7.2, actualDepth);
+  
+  displacement += swell1 + swell2 + swell3;
+  
+  // Medium waves
+  float mediumDepthMult = mix(0.1, 0.8, depthNormalized);
+  vec3 med1 = organicWave(xzPos, waveStrength * 0.25 * mediumDepthMult * swellAttenuation, 15.0, toCenter + vec2(0.3, 0.2), t * 1.31, 2.1, actualDepth);
+  vec3 med2 = organicWave(xzPos, waveStrength * 0.2 * mediumDepthMult * swellAttenuation, 12.0, toCenter + vec2(-0.2, -0.5), t * 1.57, 5.8, actualDepth);
+  
+  displacement += med1 + med2;
+  
+  // Breaking waves
+  float shallowFactor = 1.0 - depthNormalized;
+  float breakingIntensity = smoothstep(0.3, 0.7, shallowFactor);
+  
+  if (breakingIntensity > 0.05) {
+    float patch1 = wavePatch(xzPos, vec2(20.0, 15.0) + vec2(sin(t * 0.3), cos(t * 0.4)) * 30.0, t, 3.0, 25.0);
+    float patch2 = wavePatch(xzPos, vec2(-30.0, 25.0) + vec2(cos(t * 0.25), sin(t * 0.35)) * 35.0, t * 1.2, 2.8, 30.0);
+    float patch3 = wavePatch(xzPos, vec2(10.0, -20.0) + vec2(sin(t * 0.28), cos(t * 0.38)) * 25.0, t * 0.9, 3.2, 20.0);
+    
+    float breakingAttenuation = shallowWaterAttenuation(actualDepth);
+    float patchBreaking = (patch1 + patch2 + patch3) * breakingIntensity * waveStrength * 1.8 * breakingAttenuation * dryFactor;
+    
+    // Barrel/tube formation
+    vec2 toShore = -normalize(xzPos);
+    float barrelCurl = breakingIntensity * waveStrength * 2.5;
+    float curlPhase = fbm(xzPos * 0.15 + t * 0.2);
+    float lipHeight = sin(length(xzPos) * 0.3 - t * 2.5 + curlPhase * 2.0) * barrelCurl;
+    lipHeight = max(lipHeight, 0.0);
+    lipHeight *= (1.0 + curlPhase * 0.5);
+    
+    // Overhang effect (only X displacement for barrel)
+    float overhang = breakingIntensity * toShore.x * waveStrength * 0.8;
+    displacement.x += overhang * smoothstep(0.0, 1.0, lipHeight);
+    displacement.y += patchBreaking + lipHeight;
+    
+    // Turbulence
+    float turbNoise = fbm(xzPos * 0.2 + t * 0.3);
+    float turbulence = turbNoise * breakingIntensity * waveStrength * 0.6;
+    displacement.y += turbulence;
+  }
+  
+  // Shore wash
+  if (actualDepth < 2.0 && actualDepth > 0.3) {
+    float washSpeed = 2.0;
+    float wash1 = sin(length(xzPos) * 0.8 - t * washSpeed + fbm(xzPos * 0.3) * 3.0);
+    float wash2 = sin(length(xzPos) * 1.2 - t * washSpeed * 1.3 + fbm(xzPos * 0.25) * 2.5);
+    float washHeight = (wash1 * 0.5 + 0.5) * (wash2 * 0.5 + 0.5);
+    float washAttenuation = shallowWaterAttenuation(actualDepth);
+    displacement.y += washHeight * waveStrength * 0.8 * washAttenuation * dryFactor;
+  }
+  
+  // Horizontal micro-waves at intersection zone
+  float terrainDepth = actualDepth;
+  if (terrainDepth >= INTERSECTION_MIN_DEPTH && terrainDepth <= INTERSECTION_MAX_DEPTH) {
+    vec2 waveDir = vec2(toCenter.y, -toCenter.x);
+    float microFreq = 2.0;
+    float microSpeed = 1.5;
+    float microAmp = waveStrength * 0.15 * (1.0 - terrainDepth / INTERSECTION_MAX_DEPTH);
+    float microWave = sin(dot(waveDir, xzPos) * microFreq - t * microSpeed);
+    displacement.y += microWave * microAmp * dryFactor;
+  }
+  
+  // High-frequency chop
+  float chop = fbm(xzPos * 0.8 + t * 1.5) * waveStrength * 0.15 * depthNormalized * dryFactor;
+  displacement.y += chop;
+  
+  return displacement;
+}
+
 void main() {
   vUv = uv;
   vec3 pos = position;
   
   // === DEPTH CALCULATION - THE KEY ===
-  float terrainHeight = sampleTerrainHeight(pos.xz);
+  float terrainHeight = sampleTerrainHeight(pos.xz, vec2(0.0));
   float waterHeight = seaLevel;
   float depth = waterHeight - terrainHeight;
   
   vTerrainDepth = depth;
+  
+  // === PHYSICAL WATER CLAMPING ===
+  // If terrain is above sea level, clamp water to sea level and zero waves
+  bool isDry = terrainHeight >= seaLevel;
+  if (isDry) {
+    pos.y = seaLevel; // Clamp vertex to sea level
+  }
   
   // REAL DEPTH calculation from actual terrain heightmap!
   float actualDepth = max(depth, 0.0);
@@ -167,100 +287,83 @@ void main() {
   vec2 toCenter = -normalize(pos.xz + vec2(0.001));
   
   // === DEPTH-AWARE WAVE SYSTEM ===
+  // Use unified displacement function for mathematical consistency
   
-  vec3 totalWave = vec3(0.0);
+  vec3 totalWave = computeWaveDisplacement(
+    pos.xz,
+    terrainHeight,
+    actualDepth,
+    depthNormalized,
+    isDry,
+    t,
+    toCenter,
+    waveStrength
+  );
   
-  // Only generate waves where there's water
-  if (depth > 0.5) {
-    // Large swells with varied directions - MODULATED BY DEPTH
-    float deepWaveMultiplier = mix(0.2, 1.0, depthNormalized); // Much smaller in shallow
-    
-    vec3 swell1 = organicWave(pos.xz, waveStrength * 0.6 * deepWaveMultiplier, 35.0, toCenter, t, 0.0, actualDepth);
-    vec3 swell2 = organicWave(pos.xz, waveStrength * 0.4 * deepWaveMultiplier, 28.0, toCenter + vec2(0.5, -0.3), t * 1.13, 3.7, actualDepth);
-    vec3 swell3 = organicWave(pos.xz, waveStrength * 0.35 * deepWaveMultiplier, 22.0, toCenter + vec2(-0.4, 0.6), t * 0.87, 7.2, actualDepth);
-    
-    totalWave = swell1 + swell2 + swell3;
-    
-    // Medium waves - even more depth sensitive
-    float mediumDepthMult = mix(0.1, 0.8, depthNormalized);
-    vec3 med1 = organicWave(pos.xz, waveStrength * 0.25 * mediumDepthMult, 15.0, toCenter + vec2(0.3, 0.2), t * 1.31, 2.1, actualDepth);
-    vec3 med2 = organicWave(pos.xz, waveStrength * 0.2 * mediumDepthMult, 12.0, toCenter + vec2(-0.2, -0.5), t * 1.57, 5.8, actualDepth);
-    
-    totalWave += med1 + med2;
-    
-    // === BREAKING WAVES - intensify in shallow water ===
-    float shallowFactor = 1.0 - depthNormalized;
-    float breakingIntensity = smoothstep(0.3, 0.7, shallowFactor);
-    
-    // Barrel zone - where waves curl (specific depth range)
-    vBarrelIntensity = 0.0;
-    if (depth > 1.0 && depth < 5.0) {
-      vBarrelIntensity = smoothstep(1.0, 2.5, depth) * (1.0 - smoothstep(3.0, 5.0, depth));
-    }
-    
-    if (breakingIntensity > 0.05) {
-      // Wave patches that break in shallow areas
-      float patch1 = wavePatch(pos.xz, vec2(20.0, 15.0) + vec2(sin(t * 0.3), cos(t * 0.4)) * 30.0, t, 3.0, 25.0);
-      float patch2 = wavePatch(pos.xz, vec2(-30.0, 25.0) + vec2(cos(t * 0.25), sin(t * 0.35)) * 35.0, t * 1.2, 2.8, 30.0);
-      float patch3 = wavePatch(pos.xz, vec2(10.0, -20.0) + vec2(sin(t * 0.28), cos(t * 0.38)) * 25.0, t * 0.9, 3.2, 20.0);
-      
-      float patchBreaking = (patch1 + patch2 + patch3) * breakingIntensity * waveStrength * 1.8;
-      
-      // BARREL/TUBE FORMATION
-      vec2 toShore = -normalize(pos.xz);
-      float barrelCurl = vBarrelIntensity * waveStrength * 2.5;
-      
-      float curlPhase = fbm(pos.xz * 0.15 + t * 0.2);
-      float lipHeight = sin(length(pos.xz) * 0.3 - t * 2.5 + curlPhase * 2.0) * barrelCurl;
-      lipHeight = max(lipHeight, 0.0);
-      lipHeight *= (1.0 + curlPhase * 0.5);
-      
-      // Overhang effect
-      float overhang = vBarrelIntensity * toShore.x * waveStrength * 0.8;
-      pos.x += overhang * smoothstep(0.0, 1.0, lipHeight);
-      
-      totalWave.y += patchBreaking + lipHeight;
-      
-      // Turbulence
-      float turbNoise = fbm(pos.xz * 0.2 + t * 0.3);
-      float turbulence = turbNoise * breakingIntensity * waveStrength * 0.6;
-      totalWave.y += turbulence;
-    }
-    
-    // SHORE WASH - very shallow water
-    vShoreWash = 0.0;
-    if (depth < 2.0 && depth > 0.3) {
-      vShoreWash = smoothstep(0.3, 0.8, depth) * (1.0 - smoothstep(1.2, 2.0, depth));
-      
-      float washSpeed = 2.0;
-      float wash1 = sin(length(pos.xz) * 0.8 - t * washSpeed + fbm(pos.xz * 0.3) * 3.0);
-      float wash2 = sin(length(pos.xz) * 1.2 - t * washSpeed * 1.3 + fbm(pos.xz * 0.25) * 2.5);
-      
-      float washHeight = (wash1 * 0.5 + 0.5) * (wash2 * 0.5 + 0.5);
-      washHeight *= vShoreWash * waveStrength * 0.8;
-      
-      totalWave.y += washHeight;
-    }
-    
-    // High-frequency chop - only in deeper water
-    float chop = fbm(pos.xz * 0.8 + t * 1.5) * waveStrength * 0.15 * depthNormalized;
-    totalWave.y += chop;
-  } else {
-    // No waves where terrain is above water
+  // Barrel zone - where waves curl (specific depth range)
+  vBarrelIntensity = 0.0;
+  if (depth > 1.0 && depth < 5.0) {
+    vBarrelIntensity = smoothstep(1.0, 2.5, depth) * (1.0 - smoothstep(3.0, 5.0, depth));
+  }
+  
+  // Shore wash intensity
+  vShoreWash = 0.0;
+  if (depth < 2.0 && depth > 0.3) {
+    vShoreWash = smoothstep(0.3, 0.8, depth) * (1.0 - smoothstep(1.2, 2.0, depth));
+  }
+  
+  // If dry, zero out all waves (already handled in computeWaveDisplacement, but ensure consistency)
+  if (isDry) {
+    totalWave = vec3(0.0);
     vBarrelIntensity = 0.0;
     vShoreWash = 0.0;
   }
   
   // Apply displacement
   pos.x += totalWave.x;
-  pos.y += totalWave.y;
+  pos.y = seaLevel + totalWave.y; // Base position is seaLevel, add wave displacement
   pos.z += totalWave.z;
   
   vWaveHeight = totalWave.y;
   
-  // Calculate normal from wave gradients (simplified)
-  vec3 tangent = vec3(1.0, 0.0, 0.0);
-  vec3 bitangent = vec3(0.0, 0.0, 1.0);
+  // === PROPER NORMAL CALCULATION VIA DERIVATIVES ===
+  // Calculate normal based on wave height derivatives using the SAME displacement function
+  // This ensures mathematical consistency between vertex position and normals
+  float hCenter = pos.y; // Store center height (already includes seaLevel + waves)
+  
+  // Sample wave displacement at nearby points using epsilon
+  vec2 posXZ = pos.xz + vec2(NORMAL_EPSILON, 0.0);
+  vec2 posZZ = pos.xz + vec2(0.0, NORMAL_EPSILON);
+  
+  // Get terrain heights at offset positions
+  float terrainHX = sampleTerrainHeight(posXZ, vec2(0.0));
+  float terrainHZ = sampleTerrainHeight(posZZ, vec2(0.0));
+  float depthX = max(seaLevel - terrainHX, 0.0);
+  float depthZ = max(seaLevel - terrainHZ, 0.0);
+  float depthNormX = clamp(depthX / 15.0, 0.0, 1.0);
+  float depthNormZ = clamp(depthZ / 15.0, 0.0, 1.0);
+  bool isDryX = terrainHX >= seaLevel;
+  bool isDryZ = terrainHZ >= seaLevel;
+  
+  // Use the SAME unified displacement function for consistency
+  vec3 dispX = computeWaveDisplacement(posXZ, terrainHX, depthX, depthNormX, isDryX, t, toCenter, waveStrength);
+  vec3 dispZ = computeWaveDisplacement(posZZ, terrainHZ, depthZ, depthNormZ, isDryZ, t, toCenter, waveStrength);
+  
+  // Calculate total heights (seaLevel + wave displacement Y)
+  float hX = seaLevel + dispX.y;
+  float hZ = seaLevel + dispZ.y;
+  
+  // Calculate derivatives: how much height changes per unit in X and Z
+  float dHdX = (hX - hCenter) / NORMAL_EPSILON;
+  float dHdZ = (hZ - hCenter) / NORMAL_EPSILON;
+  
+  // Build tangent vectors (right-handed coordinate system)
+  // Tangent points in +X direction with slope dHdX
+  vec3 tangent = normalize(vec3(1.0, dHdX, 0.0));
+  // Bitangent points in +Z direction with slope dHdZ
+  vec3 bitangent = normalize(vec3(0.0, dHdZ, 1.0));
+  
+  // Calculate normal via cross product (order matters: cross(bitangent, tangent) for correct direction)
   vNormal = normalize(cross(bitangent, tangent));
   
   vec4 worldPos = modelMatrix * vec4(pos, 1.0);
