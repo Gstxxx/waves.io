@@ -19,6 +19,7 @@ export class TerrainControls {
   private camera: THREE.Camera;
   private domElement: HTMLElement;
   private raycaster: THREE.Raycaster;
+  private objectsToIgnore: THREE.Object3D[] = []; // Objects to ignore in raycast (e.g., water)
   
   public state: ControlsState;
   public brushConfig: BrushConfig;
@@ -148,14 +149,18 @@ export class TerrainControls {
 
   /**
    * Updates raycast to terrain
+   * Ignores water and other objects, prioritizing terrain
    */
   private updateRaycast(): void {
     this.raycaster.setFromCamera(this.state.pointerPosition, this.camera);
     
-    const intersects = this.raycaster.intersectObject(this.terrain.mesh);
+    // Test terrain directly, ignoring water
+    // We'll use a custom approach: test terrain with a filter
+    const terrainIntersects = this.raycaster.intersectObject(this.terrain.mesh, false);
     
-    if (intersects.length > 0) {
-      const point = intersects[0].point;
+    // If we hit terrain, use it
+    if (terrainIntersects.length > 0) {
+      const point = terrainIntersects[0].point;
       this.state.brushPosition = point.clone();
       this.state.isOverTerrain = true;
       
@@ -164,10 +169,42 @@ export class TerrainControls {
       this.brushIndicator.position.y += 0.1; // Slight offset to prevent z-fighting
       this.brushIndicator.visible = true;
     } else {
-      this.state.brushPosition = null;
-      this.state.isOverTerrain = false;
-      this.brushIndicator.visible = false;
+      // If terrain wasn't hit directly, try to project onto terrain plane
+      // This handles cases where water is blocking
+      const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+      const intersectionPoint = new THREE.Vector3();
+      this.raycaster.ray.intersectPlane(plane, intersectionPoint);
+      
+      // Check if intersection is within terrain bounds
+      const halfSize = this.terrain.config.size / 2;
+      if (
+        Math.abs(intersectionPoint.x) <= halfSize &&
+        Math.abs(intersectionPoint.z) <= halfSize
+      ) {
+        // Get terrain height at this point
+        const terrainHeight = this.terrain.getHeightAt(intersectionPoint.x, intersectionPoint.z);
+        intersectionPoint.y = terrainHeight;
+        
+        this.state.brushPosition = intersectionPoint.clone();
+        this.state.isOverTerrain = true;
+        
+        // Update brush indicator
+        this.brushIndicator.position.copy(intersectionPoint);
+        this.brushIndicator.position.y += 0.1;
+        this.brushIndicator.visible = true;
+      } else {
+        this.state.brushPosition = null;
+        this.state.isOverTerrain = false;
+        this.brushIndicator.visible = false;
+      }
     }
+  }
+  
+  /**
+   * Sets objects to ignore during raycast (e.g., water mesh)
+   */
+  setObjectsToIgnore(objects: THREE.Object3D[]): void {
+    this.objectsToIgnore = objects;
   }
 
   /**

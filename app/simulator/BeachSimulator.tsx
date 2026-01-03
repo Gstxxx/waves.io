@@ -52,6 +52,7 @@ function Terrain({
 // Water Component
 function Water({
   waterRef,
+  terrainRef,
   seaLevel,
   waveIntensity,
   waveSpeed,
@@ -60,6 +61,7 @@ function Water({
   timeScale,
 }: {
   waterRef: React.MutableRefObject<WaterSystem | null>;
+  terrainRef: React.MutableRefObject<TerrainSystem | null>;
   seaLevel: number;
   waveIntensity: number;
   waveSpeed: number;
@@ -84,6 +86,14 @@ function Water({
       water.dispose();
     };
   }, [water, waterRef]);
+
+  // Connect terrain heightmap to water - THIS IS THE KEY!
+  useEffect(() => {
+    const terrain = terrainRef.current;
+    if (terrain && terrain.heightmapTexture) {
+      water.setTerrainHeightmap(terrain.heightmapTexture, terrain.config.size);
+    }
+  }, [water, terrainRef]);
 
   useEffect(() => {
     water.setSeaLevel(seaLevel);
@@ -341,6 +351,7 @@ function Scene({
       {/* Water */}
       <Water
         waterRef={waterRef}
+        terrainRef={terrainRef}
         seaLevel={seaLevel}
         waveIntensity={waveIntensity}
         waveSpeed={waveSpeed}

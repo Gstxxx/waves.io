@@ -29,18 +29,19 @@ export class TerrainSystem {
   public geometry: THREE.PlaneGeometry;
   public heightmap: Float32Array;
   public config: TerrainConfig;
-  
+  public heightmapTexture: THREE.DataTexture; // GPU texture for water shader
+
   private noise2D: ReturnType<typeof createNoise2D>;
   private material: THREE.ShaderMaterial;
 
   constructor(config: Partial<TerrainConfig> = {}) {
     this.config = { ...defaultTerrainConfig, ...config };
     this.noise2D = createNoise2D();
-    
+
     // Initialize heightmap
     const vertexCount = (this.config.segments + 1) * (this.config.segments + 1);
     this.heightmap = new Float32Array(vertexCount);
-    
+
     // Create geometry
     this.geometry = new THREE.PlaneGeometry(
       this.config.size,
@@ -49,17 +50,75 @@ export class TerrainSystem {
       this.config.segments
     );
     this.geometry.rotateX(-Math.PI / 2);
-    
+
     // Create material (will be replaced by shader material later)
     this.material = this.createMaterial();
-    
+
     // Create mesh
     this.mesh = new THREE.Mesh(this.geometry, this.material);
     this.mesh.receiveShadow = true;
     this.mesh.castShadow = true;
-    
+
     // Generate initial terrain
     this.generateInitialTerrain();
+
+    // Create heightmap texture for water shader
+    this.heightmapTexture = this.createHeightmapTexture();
+  }
+
+  /**
+   * Creates a DataTexture from the heightmap for GPU access
+   * This allows the water shader to read terrain height
+   */
+  createHeightmapTexture(): THREE.DataTexture {
+    const size = this.config.segments + 1;
+
+    // Normalize heightmap values to 0-1 range for texture
+    // We'll store normalized height, then denormalize in shader
+    const minHeight = this.config.minHeight;
+    const maxHeight = this.config.maxHeight;
+    const heightRange = maxHeight - minHeight;
+
+    const data = new Float32Array(size * size);
+
+    for (let i = 0; i < this.heightmap.length; i++) {
+      // Normalize to 0-1 range
+      data[i] = (this.heightmap[i] - minHeight) / heightRange;
+    }
+
+    const texture = new THREE.DataTexture(
+      data,
+      size,
+      size,
+      THREE.RedFormat,
+      THREE.FloatType
+    );
+
+    texture.needsUpdate = true;
+    texture.wrapS = THREE.ClampToEdgeWrapping;
+    texture.wrapT = THREE.ClampToEdgeWrapping;
+    texture.magFilter = THREE.LinearFilter;
+    texture.minFilter = THREE.LinearFilter;
+
+    return texture;
+  }
+
+  /**
+   * Updates the heightmap texture after terrain modifications
+   */
+  updateHeightmapTexture(): void {
+    const size = this.config.segments + 1;
+    const minHeight = this.config.minHeight;
+    const maxHeight = this.config.maxHeight;
+    const heightRange = maxHeight - minHeight;
+
+    const data = this.heightmapTexture.image.data as Float32Array;
+
+    for (let i = 0; i < this.heightmap.length; i++) {
+      data[i] = (this.heightmap[i] - minHeight) / heightRange;
+    }
+
+    this.heightmapTexture.needsUpdate = true;
   }
 
   /**
@@ -129,41 +188,50 @@ export class TerrainSystem {
   generateInitialTerrain(): void {
     const positions = this.geometry.attributes.position.array as Float32Array;
     const { segments, noiseScale, noiseOctaves, maxHeight, minHeight } = this.config;
-    
+
+    // Helper function for smooth transitions
+    const smoothstep = (edge0: number, edge1: number, x: number): number => {
+      const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+      return t * t * (3 - 2 * t);
+    };
+
     for (let i = 0; i <= segments; i++) {
       for (let j = 0; j <= segments; j++) {
         const index = i * (segments + 1) + j;
         const vertexIndex = index * 3;
-        
+
         const x = positions[vertexIndex];
         const z = positions[vertexIndex + 2];
-        
+
         // Multi-octave noise for natural terrain
         let height = 0;
         let amplitude = 1;
         let frequency = noiseScale;
         let maxAmplitude = 0;
-        
+
         for (let o = 0; o < noiseOctaves; o++) {
           height += this.noise2D(x * frequency, z * frequency) * amplitude;
           maxAmplitude += amplitude;
           amplitude *= 0.5;
           frequency *= 2;
         }
-        
+
         height = (height / maxAmplitude) * 0.5 + 0.5; // Normalize to 0-1
         height = minHeight + height * (maxHeight - minHeight);
-        
-        // Create beach slope towards edges
-        const distFromCenter = Math.sqrt(x * x + z * z) / (this.config.size * 0.5);
-        const edgeFalloff = Math.pow(Math.max(0, distFromCenter - 0.6) / 0.4, 2);
-        height -= edgeFalloff * (maxHeight - minHeight);
-        
+
+        // Create natural coastal terrain - land extends to edges
+        // Add gradual slope towards one side (ocean side)
+        const oceanSide = z / (this.config.size * 0.5); // -1 to 1
+        const coastalSlope = smoothstep(-0.8, 0.8, oceanSide);
+
+        // Land is higher inland, slopes down towards ocean
+        height = height * (1.0 - coastalSlope * 0.6) + coastalSlope * minHeight;
+
         this.heightmap[index] = height;
         positions[vertexIndex + 1] = height;
       }
     }
-    
+
     this.geometry.attributes.position.needsUpdate = true;
     this.geometry.computeVertexNormals();
   }
@@ -174,15 +242,15 @@ export class TerrainSystem {
   getHeightAt(x: number, z: number): number {
     const { size, segments } = this.config;
     const halfSize = size / 2;
-    
+
     // Convert world coords to grid coords
     const gridX = ((x + halfSize) / size) * segments;
     const gridZ = ((z + halfSize) / size) * segments;
-    
+
     // Clamp to valid range
     const i = Math.floor(Math.max(0, Math.min(segments, gridZ)));
     const j = Math.floor(Math.max(0, Math.min(segments, gridX)));
-    
+
     const index = i * (segments + 1) + j;
     return this.heightmap[index] ?? 0;
   }
@@ -200,41 +268,44 @@ export class TerrainSystem {
     const { size, segments } = this.config;
     const halfSize = size / 2;
     const positions = this.geometry.attributes.position.array as Float32Array;
-    
+
     // Calculate affected grid range
     const gridRadius = (radius / size) * segments;
     const centerGridX = ((centerX + halfSize) / size) * segments;
     const centerGridZ = ((centerZ + halfSize) / size) * segments;
-    
+
     const minI = Math.max(0, Math.floor(centerGridZ - gridRadius));
     const maxI = Math.min(segments, Math.ceil(centerGridZ + gridRadius));
     const minJ = Math.max(0, Math.floor(centerGridX - gridRadius));
     const maxJ = Math.min(segments, Math.ceil(centerGridX + gridRadius));
-    
+
     for (let i = minI; i <= maxI; i++) {
       for (let j = minJ; j <= maxJ; j++) {
         const index = i * (segments + 1) + j;
         const vertexIndex = index * 3;
-        
+
         const vx = positions[vertexIndex];
         const vz = positions[vertexIndex + 2];
-        
+
         const dx = vx - centerX;
         const dz = vz - centerZ;
         const distance = Math.sqrt(dx * dx + dz * dz);
-        
+
         if (distance <= radius) {
           const factor = falloff(distance, radius);
           const delta = strength * factor;
-          
+
           this.heightmap[index] += delta;
           positions[vertexIndex + 1] = this.heightmap[index];
         }
       }
     }
-    
+
     this.geometry.attributes.position.needsUpdate = true;
     this.geometry.computeVertexNormals();
+
+    // Update heightmap texture for water shader
+    this.updateHeightmapTexture();
   }
 
   /**
@@ -248,25 +319,25 @@ export class TerrainSystem {
     const { size, segments } = this.config;
     const halfSize = size / 2;
     const positions = this.geometry.attributes.position.array as Float32Array;
-    
+
     const gridRadius = (radius / size) * segments;
     const centerGridX = ((centerX + halfSize) / size) * segments;
     const centerGridZ = ((centerZ + halfSize) / size) * segments;
-    
+
     const minI = Math.max(0, Math.floor(centerGridZ - gridRadius));
     const maxI = Math.min(segments, Math.ceil(centerGridZ + gridRadius));
     const minJ = Math.max(0, Math.floor(centerGridX - gridRadius));
     const maxJ = Math.min(segments, Math.ceil(centerGridX + gridRadius));
-    
+
     const indices: number[] = [];
     const heights: number[] = [];
     const posArray: { x: number; z: number }[] = [];
-    
+
     for (let i = minI; i <= maxI; i++) {
       for (let j = minJ; j <= maxJ; j++) {
         const index = i * (segments + 1) + j;
         const vertexIndex = index * 3;
-        
+
         indices.push(index);
         heights.push(this.heightmap[index]);
         posArray.push({
@@ -275,7 +346,7 @@ export class TerrainSystem {
         });
       }
     }
-    
+
     return { indices, heights, positions: posArray };
   }
 
@@ -284,14 +355,17 @@ export class TerrainSystem {
    */
   applyHeightmapChanges(changes: Map<number, number>): void {
     const positions = this.geometry.attributes.position.array as Float32Array;
-    
+
     changes.forEach((height, index) => {
       this.heightmap[index] = height;
       positions[index * 3 + 1] = height;
     });
-    
+
     this.geometry.attributes.position.needsUpdate = true;
     this.geometry.computeVertexNormals();
+
+    // Update heightmap texture for water shader
+    this.updateHeightmapTexture();
   }
 
   /**

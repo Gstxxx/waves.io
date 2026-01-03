@@ -27,7 +27,7 @@ export const defaultWaterConfig: WaterConfig = {
   opacity: 0.9,
 };
 
-// Vertex shader for water with breaking waves
+// Vertex shader for water with breaking waves - DEPTH AWARE
 const waterVertexShader = `
 uniform float time;
 uniform float waveStrength;
@@ -42,23 +42,12 @@ varying vec3 vViewPosition;
 varying vec2 vUv;
 varying float vWaveHeight;
 varying float vDepth;
+varying float vBarrelIntensity;
+varying float vShoreWash;
+varying float vTerrainDepth; // NEW: actual depth to terrain
+varying float vDepthNormalized; // NEW: normalized depth for colors
 
-// Gerstner wave function for realistic ocean waves
-vec3 gerstnerWave(vec2 position, float steepness, float wavelength, vec2 direction, float time) {
-  float k = 2.0 * 3.14159 / wavelength;
-  float c = sqrt(9.8 / k);
-  vec2 d = normalize(direction);
-  float f = k * (dot(d, position) - c * time);
-  float a = steepness / k;
-  
-  return vec3(
-    d.x * (a * cos(f)),
-    a * sin(f),
-    d.y * (a * cos(f))
-  );
-}
-
-// Noise function for turbulence
+// Enhanced noise functions for organic variation
 float hash(vec2 p) {
   return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
 }
@@ -76,78 +65,202 @@ float noise(vec2 p) {
   return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
+// Fractal Brownian Motion for complex patterns
+float fbm(vec2 p) {
+  float value = 0.0;
+  float amplitude = 0.5;
+  float frequency = 1.0;
+  for (int i = 0; i < 5; i++) {
+    value += amplitude * noise(p * frequency);
+    frequency *= 2.0;
+    amplitude *= 0.5;
+  }
+  return value;
+}
+
+// Sample terrain height from REAL heightmap texture
+// This is the KEY - water now sees the actual terrain!
+float sampleTerrainHeight(vec2 worldPos) {
+  // Convert world position to UV coordinates (0-1 range)
+  // World position is centered at origin, so we offset by half size
+  vec2 terrainUV = (worldPos / terrainSize) + 0.5;
+  
+  // Clamp to valid texture range
+  terrainUV = clamp(terrainUV, 0.0, 1.0);
+  
+  // Sample heightmap texture (normalized 0-1, needs denormalization)
+  float normalizedHeight = texture2D(terrainHeightMap, terrainUV).r;
+  
+  // Denormalize: heightmap stores 0-1, we need actual height range
+  // Assuming terrain height range is -5 to 15 (20 units total)
+  float minHeight = -5.0;
+  float maxHeight = 15.0;
+  float heightRange = maxHeight - minHeight;
+  
+  float terrainHeight = minHeight + normalizedHeight * heightRange;
+  
+  return terrainHeight;
+}
+
+// Organic Gerstner-like wave with noise modulation - NOW DEPTH AWARE
+vec3 organicWave(vec2 position, float steepness, float wavelength, vec2 baseDir, float time, float phaseOffset, float depthFactor) {
+  // Add noise to make each wave unique
+  float noiseVal = fbm(position * 0.05 + vec2(phaseOffset * 10.0));
+  
+  // Vary direction slightly based on position
+  vec2 direction = normalize(baseDir + vec2(noiseVal - 0.5, noise(position * 0.1) - 0.5) * 0.4);
+  
+  float k = 2.0 * 3.14159 / wavelength;
+  float c = sqrt(9.8 / k);
+  
+  // DEPTH AWARENESS: waves slow down and shorten in shallow water
+  // Shallow water physics: c = sqrt(g * depth)
+  float shallowFactor = smoothstep(0.0, 10.0, depthFactor); // 0 in very shallow, 1 in deep
+  c *= 0.3 + shallowFactor * 0.7; // Speed reduces in shallow water
+  
+  // Add noise to frequency for irregular timing
+  float timeVariation = time + noiseVal * 2.0;
+  float f = k * (dot(direction, position) - c * timeVariation + phaseOffset);
+  
+  // Variable amplitude based on local noise AND depth
+  // Shallow water = smaller waves
+  float amplitudeScale = 0.5 + shallowFactor * 0.5;
+  float localAmp = (0.8 + noiseVal * 0.4) * steepness / k * amplitudeScale;
+  
+  return vec3(
+    direction.x * (localAmp * cos(f)),
+    localAmp * sin(f),
+    direction.y * (localAmp * cos(f))
+  );
+}
+
+// Individual wave patches that form and dissipate
+float wavePatch(vec2 pos, vec2 center, float time, float speed, float size) {
+  float dist = length(pos - center);
+  float wave = sin(dist * 2.0 - time * speed) * 0.5 + 0.5;
+  float falloff = smoothstep(size, 0.0, dist);
+  return wave * falloff;
+}
+
 void main() {
   vUv = uv;
-  
   vec3 pos = position;
   
-  // Calculate distance from center (proxy for depth)
-  float distFromCenter = length(pos.xz) / (terrainSize.x * 0.5);
-  vDepth = smoothstep(0.0, 0.8, distFromCenter);
+  // === DEPTH CALCULATION - THE KEY ===
+  float terrainHeight = sampleTerrainHeight(pos.xz);
+  float waterHeight = seaLevel;
+  float depth = waterHeight - terrainHeight;
   
-  // Multiple overlapping waves for realism
+  vTerrainDepth = depth;
+  
+  // REAL DEPTH calculation from actual terrain heightmap!
+  float actualDepth = max(depth, 0.0);
+  float depthNormalized = clamp(actualDepth / 15.0, 0.0, 1.0); // Normalize to 0-1 range
+  
+  // Pass to fragment shader
+  vDepth = depthNormalized; // Use real depth, not fake distance
+  vDepthNormalized = depthNormalized;
+  
   float t = time * waveSpeed;
   
-  // Waves move towards shore (radially inward)
-  vec2 toCenter = -normalize(pos.xz + vec2(0.001)); // Direction towards center
-  vec2 waveDir1 = toCenter;
-  vec2 waveDir2 = vec2(toCenter.x + 0.3, toCenter.y - 0.2);
-  vec2 waveDir3 = vec2(toCenter.x - 0.2, toCenter.y + 0.3);
+  // General wave direction towards shore
+  vec2 toCenter = -normalize(pos.xz + vec2(0.001));
   
-  // Primary waves - larger in deep water
-  float deepWaveMultiplier = mix(0.3, 1.0, vDepth);
-  vec3 wave1 = gerstnerWave(pos.xz, waveStrength * 0.5 * deepWaveMultiplier, 30.0, waveDir1, t);
-  vec3 wave2 = gerstnerWave(pos.xz, waveStrength * 0.3 * deepWaveMultiplier, 20.0, waveDir2, t * 1.1);
-  vec3 wave3 = gerstnerWave(pos.xz, waveStrength * 0.25 * deepWaveMultiplier, 15.0, waveDir3, t * 0.9);
+  // === DEPTH-AWARE WAVE SYSTEM ===
   
-  // Breaking waves in shallow water - steeper and more chaotic
-  float shallowFactor = 1.0 - vDepth;
-  float breakingIntensity = smoothstep(0.3, 0.7, shallowFactor);
+  vec3 totalWave = vec3(0.0);
   
-  // Add turbulence and steepness in breaking zone
-  float turbulence = noise(pos.xz * 0.3 + t * 0.5) * breakingIntensity;
-  float breakingWave = sin(length(pos.xz) * 0.5 - t * 3.0) * breakingIntensity * waveStrength * 1.5;
+  // Only generate waves where there's water
+  if (depth > 0.5) {
+    // Large swells with varied directions - MODULATED BY DEPTH
+    float deepWaveMultiplier = mix(0.2, 1.0, depthNormalized); // Much smaller in shallow
+    
+    vec3 swell1 = organicWave(pos.xz, waveStrength * 0.6 * deepWaveMultiplier, 35.0, toCenter, t, 0.0, actualDepth);
+    vec3 swell2 = organicWave(pos.xz, waveStrength * 0.4 * deepWaveMultiplier, 28.0, toCenter + vec2(0.5, -0.3), t * 1.13, 3.7, actualDepth);
+    vec3 swell3 = organicWave(pos.xz, waveStrength * 0.35 * deepWaveMultiplier, 22.0, toCenter + vec2(-0.4, 0.6), t * 0.87, 7.2, actualDepth);
+    
+    totalWave = swell1 + swell2 + swell3;
+    
+    // Medium waves - even more depth sensitive
+    float mediumDepthMult = mix(0.1, 0.8, depthNormalized);
+    vec3 med1 = organicWave(pos.xz, waveStrength * 0.25 * mediumDepthMult, 15.0, toCenter + vec2(0.3, 0.2), t * 1.31, 2.1, actualDepth);
+    vec3 med2 = organicWave(pos.xz, waveStrength * 0.2 * mediumDepthMult, 12.0, toCenter + vec2(-0.2, -0.5), t * 1.57, 5.8, actualDepth);
+    
+    totalWave += med1 + med2;
+    
+    // === BREAKING WAVES - intensify in shallow water ===
+    float shallowFactor = 1.0 - depthNormalized;
+    float breakingIntensity = smoothstep(0.3, 0.7, shallowFactor);
+    
+    // Barrel zone - where waves curl (specific depth range)
+    vBarrelIntensity = 0.0;
+    if (depth > 1.0 && depth < 5.0) {
+      vBarrelIntensity = smoothstep(1.0, 2.5, depth) * (1.0 - smoothstep(3.0, 5.0, depth));
+    }
+    
+    if (breakingIntensity > 0.05) {
+      // Wave patches that break in shallow areas
+      float patch1 = wavePatch(pos.xz, vec2(20.0, 15.0) + vec2(sin(t * 0.3), cos(t * 0.4)) * 30.0, t, 3.0, 25.0);
+      float patch2 = wavePatch(pos.xz, vec2(-30.0, 25.0) + vec2(cos(t * 0.25), sin(t * 0.35)) * 35.0, t * 1.2, 2.8, 30.0);
+      float patch3 = wavePatch(pos.xz, vec2(10.0, -20.0) + vec2(sin(t * 0.28), cos(t * 0.38)) * 25.0, t * 0.9, 3.2, 20.0);
+      
+      float patchBreaking = (patch1 + patch2 + patch3) * breakingIntensity * waveStrength * 1.8;
+      
+      // BARREL/TUBE FORMATION
+      vec2 toShore = -normalize(pos.xz);
+      float barrelCurl = vBarrelIntensity * waveStrength * 2.5;
+      
+      float curlPhase = fbm(pos.xz * 0.15 + t * 0.2);
+      float lipHeight = sin(length(pos.xz) * 0.3 - t * 2.5 + curlPhase * 2.0) * barrelCurl;
+      lipHeight = max(lipHeight, 0.0);
+      lipHeight *= (1.0 + curlPhase * 0.5);
+      
+      // Overhang effect
+      float overhang = vBarrelIntensity * toShore.x * waveStrength * 0.8;
+      pos.x += overhang * smoothstep(0.0, 1.0, lipHeight);
+      
+      totalWave.y += patchBreaking + lipHeight;
+      
+      // Turbulence
+      float turbNoise = fbm(pos.xz * 0.2 + t * 0.3);
+      float turbulence = turbNoise * breakingIntensity * waveStrength * 0.6;
+      totalWave.y += turbulence;
+    }
+    
+    // SHORE WASH - very shallow water
+    vShoreWash = 0.0;
+    if (depth < 2.0 && depth > 0.3) {
+      vShoreWash = smoothstep(0.3, 0.8, depth) * (1.0 - smoothstep(1.2, 2.0, depth));
+      
+      float washSpeed = 2.0;
+      float wash1 = sin(length(pos.xz) * 0.8 - t * washSpeed + fbm(pos.xz * 0.3) * 3.0);
+      float wash2 = sin(length(pos.xz) * 1.2 - t * washSpeed * 1.3 + fbm(pos.xz * 0.25) * 2.5);
+      
+      float washHeight = (wash1 * 0.5 + 0.5) * (wash2 * 0.5 + 0.5);
+      washHeight *= vShoreWash * waveStrength * 0.8;
+      
+      totalWave.y += washHeight;
+    }
+    
+    // High-frequency chop - only in deeper water
+    float chop = fbm(pos.xz * 0.8 + t * 1.5) * waveStrength * 0.15 * depthNormalized;
+    totalWave.y += chop;
+  } else {
+    // No waves where terrain is above water
+    vBarrelIntensity = 0.0;
+    vShoreWash = 0.0;
+  }
   
-  // Small ripples
-  float ripple = sin(pos.x * 0.5 + t * 2.0) * sin(pos.z * 0.5 + t * 1.5) * waveStrength * 0.1;
-  
-  // Combine waves
-  vec3 totalWave = wave1 + wave2 + wave3;
+  // Apply displacement
   pos.x += totalWave.x;
-  pos.y += totalWave.y + ripple + breakingWave + turbulence * 0.5;
+  pos.y += totalWave.y;
   pos.z += totalWave.z;
   
-  vWaveHeight = totalWave.y + breakingWave;
+  vWaveHeight = totalWave.y;
   
-  // Calculate normal from wave gradients
-  float delta = 0.1;
-  vec3 posX = position + vec3(delta, 0.0, 0.0);
-  vec3 posZ = position + vec3(0.0, 0.0, delta);
-  
-  float distX = length(posX.xz) / (terrainSize.x * 0.5);
-  float depthX = smoothstep(0.0, 0.8, distX);
-  float shallowX = 1.0 - depthX;
-  float breakingX = smoothstep(0.3, 0.7, shallowX);
-  
-  float distZ = length(posZ.xz) / (terrainSize.x * 0.5);
-  float depthZ = smoothstep(0.0, 0.8, distZ);
-  float shallowZ = 1.0 - depthZ;
-  float breakingZ = smoothstep(0.3, 0.7, shallowZ);
-  
-  vec3 waveX1 = gerstnerWave(posX.xz, waveStrength * 0.5, 30.0, waveDir1, t);
-  vec3 waveX2 = gerstnerWave(posX.xz, waveStrength * 0.3, 20.0, waveDir2, t * 1.1);
-  vec3 waveX = waveX1 + waveX2;
-  float breakingWaveX = sin(length(posX.xz) * 0.5 - t * 3.0) * breakingX * waveStrength * 1.5;
-  posX.y += waveX.y + breakingWaveX;
-  
-  vec3 waveZ1 = gerstnerWave(posZ.xz, waveStrength * 0.5, 30.0, waveDir1, t);
-  vec3 waveZ2 = gerstnerWave(posZ.xz, waveStrength * 0.3, 20.0, waveDir2, t * 1.1);
-  vec3 waveZ = waveZ1 + waveZ2;
-  float breakingWaveZ = sin(length(posZ.xz) * 0.5 - t * 3.0) * breakingZ * waveStrength * 1.5;
-  posZ.y += waveZ.y + breakingWaveZ;
-  
-  vec3 tangent = normalize(posX - pos);
-  vec3 bitangent = normalize(posZ - pos);
+  // Calculate normal from wave gradients (simplified)
+  vec3 tangent = vec3(1.0, 0.0, 0.0);
+  vec3 bitangent = vec3(0.0, 0.0, 1.0);
   vNormal = normalize(cross(bitangent, tangent));
   
   vec4 worldPos = modelMatrix * vec4(pos, 1.0);
@@ -179,6 +292,10 @@ varying vec3 vViewPosition;
 varying vec2 vUv;
 varying float vWaveHeight;
 varying float vDepth;
+varying float vBarrelIntensity;
+varying float vShoreWash;
+varying float vTerrainDepth; // NEW: actual depth to terrain
+varying float vDepthNormalized; // NEW: normalized depth for colors
 
 // Simple noise for foam
 float hash(vec2 p) {
@@ -217,9 +334,15 @@ void main() {
   float fresnel = pow(1.0 - max(dot(viewDir, normal), 0.0), 4.0);
   fresnel = mix(0.04, 1.0, fresnel);
   
-  // Depth-based color (shallow = close to shore, deep = far from shore)
-  float shallowFactor = 1.0 - vDepth;
-  vec3 waterColor = mix(deepColor, shallowColor, shallowFactor);
+  // === DEPTH-AWARE COLOR ===
+  // Use actual depth for color, not just distance from center
+  vec3 waterColor = mix(shallowColor, deepColor, vDepthNormalized);
+  
+  // Very shallow water (less than 1 unit) is extra light
+  if (vTerrainDepth < 1.5) {
+    float veryShallow = 1.0 - smoothstep(0.0, 1.5, vTerrainDepth);
+    waterColor = mix(waterColor, shallowColor * 1.2, veryShallow);
+  }
   
   // Add variation based on waves
   float waveColorVar = fbm(vWorldPosition.xz * 0.05 + time * 0.1);
@@ -243,48 +366,104 @@ void main() {
   float scatter = pow(max(dot(viewDir, -sunDirection), 0.0), 2.0);
   vec3 subsurface = shallowColor * scatter * 0.2;
   
-  // === BREAKING WAVE FOAM ===
+  // === DEPTH-AWARE FOAM ===
   
-  // Calculate breaking intensity based on shallow water
-  float breakingZone = smoothstep(0.3, 0.7, shallowFactor);
+  // Use actual terrain depth for better foam placement
+  float actualDepth = max(vTerrainDepth, 0.0);
+  float depthNormalized = smoothstep(0.0, 10.0, actualDepth);
   
-  // Multi-layered foam noise for realism
-  float foamNoise1 = fbm(vWorldPosition.xz * 0.5 + time * 0.8);
-  float foamNoise2 = fbm(vWorldPosition.xz * 1.0 - time * 0.6);
-  float foamNoise3 = noise(vWorldPosition.xz * 2.0 + time * 1.2);
-  
-  // Combine foam noises
-  float foamPattern = foamNoise1 * 0.5 + foamNoise2 * 0.3 + foamNoise3 * 0.2;
-  
-  // Wave crest foam (at peaks)
-  float waveHeight = vWaveHeight / max(waveStrength, 0.01);
-  float crestFoam = smoothstep(0.4, 1.0, waveHeight) * foamPattern;
-  
-  // Breaking wave foam - intense in shallow water
-  float breakingFoam = breakingZone * foamPattern;
-  breakingFoam *= smoothstep(0.2, 0.8, foamNoise1);
-  
-  // Turbulent foam patterns in breaking zone
-  float turbulentFoam = 0.0;
-  if (breakingZone > 0.3) {
-    vec2 flowDir = normalize(vWorldPosition.xz);
-    float flowPattern = fbm(vWorldPosition.xz * 0.3 + flowDir * time * 0.5);
-    turbulentFoam = breakingZone * flowPattern * smoothstep(0.4, 0.9, foamNoise2);
+  // Calculate breaking intensity based on actual depth
+  float breakingZone = 0.0;
+  if (actualDepth > 0.5 && actualDepth < 8.0) {
+    breakingZone = smoothstep(0.5, 3.0, actualDepth) * (1.0 - smoothstep(5.0, 8.0, actualDepth));
   }
   
-  // Combine all foam types
-  float foamFactor = max(max(crestFoam, breakingFoam), turbulentFoam);
-  foamFactor = smoothstep(0.3, 0.9, foamFactor);
+  // Multi-scale foam noise for organic appearance
+  vec2 foamCoord1 = vWorldPosition.xz * 0.4 + vec2(time * 0.3, time * 0.2);
+  vec2 foamCoord2 = vWorldPosition.xz * 0.8 - vec2(time * 0.5, time * 0.4);
+  vec2 foamCoord3 = vWorldPosition.xz * 1.5 + vec2(time * 0.7, -time * 0.6);
   
-  // Extra intense foam right at the breaking zone
-  float breakingEdge = smoothstep(0.55, 0.65, shallowFactor) * (1.0 - smoothstep(0.65, 0.75, shallowFactor));
-  foamFactor = max(foamFactor, breakingEdge * foamNoise1 * 1.5);
+  float foamNoise1 = fbm(foamCoord1);
+  float foamNoise2 = fbm(foamCoord2);
+  float foamNoise3 = noise(foamCoord3);
   
-  // Animated foam streaks
-  float streaks = abs(sin(vWorldPosition.x * 2.0 + time * 2.0)) * abs(sin(vWorldPosition.z * 2.0 - time * 1.5));
-  foamFactor += streaks * breakingZone * 0.3;
+  // Combine with different weights for variety
+  float foamPattern = foamNoise1 * 0.4 + foamNoise2 * 0.35 + foamNoise3 * 0.25;
+  
+  // Wave height-based foam (foam at peaks)
+  float waveHeightNorm = vWaveHeight / max(waveStrength, 0.01);
+  float peakFoam = smoothstep(0.3, 0.8, waveHeightNorm);
+  peakFoam *= smoothstep(0.3, 0.7, foamPattern);
+  
+  // === BARREL LIP FOAM (intense spray and foam curtain) ===
+  float barrelLipFoam = 0.0;
+  if (vBarrelIntensity > 0.1) {
+    // Intense foam at the lip of the barrel
+    float lipNoise = fbm(vWorldPosition.xz * 0.6 + time * 1.5);
+    float lipFoam = smoothstep(0.4, 0.9, lipNoise) * vBarrelIntensity;
+    
+    // Spray effect (mist from the lip)
+    float sprayNoise = noise(vWorldPosition.xz * 2.0 + time * 2.0);
+    float spray = smoothstep(0.5, 1.0, sprayNoise) * vBarrelIntensity * 0.8;
+    
+    // Curtain of foam falling from the lip
+    float curtain = smoothstep(0.3, 0.7, foamNoise1) * vBarrelIntensity * 1.2;
+    
+    barrelLipFoam = max(max(lipFoam, spray), curtain);
+  }
+  
+  // Breaking wave foam - irregular and patchy
+  float breakingFoam = 0.0;
+  if (breakingZone > 0.2) {
+    // Create irregular foam patches
+    float patch1 = smoothstep(0.5, 0.8, foamNoise1) * breakingZone;
+    float patch2 = smoothstep(0.4, 0.75, foamNoise2) * breakingZone * 0.8;
+    
+    // Add some larger foam areas
+    float largePatch = smoothstep(0.6, 0.9, fbm(vWorldPosition.xz * 0.15 + time * 0.2));
+    largePatch *= breakingZone;
+    
+    breakingFoam = max(max(patch1, patch2), largePatch * 0.6);
+  }
+  
+  // === SHORE WASH FOAM (persistent foam at the water's edge) ===
+  float washFoam = 0.0;
+  if (vShoreWash > 0.1) {
+    // Dense foam in the wash zone
+    float washNoise1 = fbm(vWorldPosition.xz * 1.2 + time * 0.4);
+    float washNoise2 = noise(vWorldPosition.xz * 2.5 - time * 0.6);
+    
+    // Very dense foam that lingers
+    washFoam = smoothstep(0.2, 0.8, washNoise1) * vShoreWash;
+    washFoam = max(washFoam, smoothstep(0.4, 0.9, washNoise2) * vShoreWash * 0.7);
+    
+    // Bubbles and texture in the wash
+    float bubbles = noise(vWorldPosition.xz * 5.0 + time * 1.0);
+    washFoam += bubbles * vShoreWash * 0.3;
+  }
+  
+  // Foam streaks and trails
+  float streakNoise = abs(noise(vWorldPosition.xz * 0.6 + vec2(time * 1.2, time * 0.8)));
+  float streaks = smoothstep(0.6, 0.9, streakNoise) * breakingZone * 0.5;
+  
+  // Localized intense foam bursts
+  float burst1 = smoothstep(0.8, 0.95, foamNoise1) * peakFoam;
+  float burst2 = smoothstep(0.75, 0.9, foamNoise3) * breakingZone;
+  
+  // Combine all foam types with priorities
+  float foamFactor = peakFoam * 0.2 + breakingFoam * 0.5 + streaks + burst1 * 0.3 + burst2 * 0.4;
+  
+  // Barrel lip foam is most intense
+  foamFactor = max(foamFactor, barrelLipFoam * 1.5);
+  
+  // Shore wash foam is dense and persistent
+  foamFactor = max(foamFactor, washFoam * 1.3);
   
   foamFactor = clamp(foamFactor, 0.0, 1.0);
+  
+  // Add temporal variation to foam (foam appears and disappears)
+  float foamFlicker = 0.85 + noise(vWorldPosition.xz * 2.0 + time * 3.0) * 0.15;
+  foamFactor *= foamFlicker;
   
   // === Combine everything ===
   vec3 finalColor = waterColor * 0.3;
@@ -293,12 +472,12 @@ void main() {
   finalColor += skyReflection;
   finalColor += subsurface;
   
-  // Blend foam with water
-  vec3 foamWithHighlight = foamColor + specColor * 0.5; // Foam is slightly reflective
-  finalColor = mix(finalColor, foamWithHighlight, foamFactor * 0.85);
+  // Blend foam with water - foam is bright and slightly reflective
+  vec3 foamWithHighlight = foamColor + specColor * 0.3;
+  finalColor = mix(finalColor, foamWithHighlight, foamFactor * 0.8);
   
-  // Extra brightness in breaking zone
-  finalColor += vec3(1.0) * breakingZone * foamFactor * 0.2;
+  // Extra brightness in intense foam areas
+  finalColor += vec3(1.0) * foamFactor * foamFactor * 0.15;
   
   // Tone mapping
   finalColor = finalColor / (finalColor + vec3(1.0));
@@ -307,7 +486,7 @@ void main() {
   // Transparency - foam is more opaque
   float alpha = mix(0.7, 0.95, fresnel);
   alpha = mix(alpha, 1.0, vDepth * 0.3);
-  alpha = mix(alpha, 1.0, foamFactor * 0.5); // Foam is less transparent
+  alpha = mix(alpha, 0.98, foamFactor * 0.6); // Foam is less transparent
   alpha *= opacity;
   
   gl_FragColor = vec4(finalColor, alpha);
@@ -322,7 +501,7 @@ export class WaterSystem {
 
   constructor(config: Partial<WaterConfig> = {}) {
     this.config = { ...defaultWaterConfig, ...config };
-    
+
     // Create geometry
     this.geometry = new THREE.PlaneGeometry(
       this.config.size,
@@ -331,7 +510,7 @@ export class WaterSystem {
       this.config.segments
     );
     this.geometry.rotateX(-Math.PI / 2);
-    
+
     // Create shader material
     this.material = new THREE.ShaderMaterial({
       uniforms: {
@@ -347,6 +526,7 @@ export class WaterSystem {
         skyColor: { value: new THREE.Color('#87CEEB') },
         opacity: { value: this.config.opacity },
         terrainSize: { value: new THREE.Vector2(this.config.size, this.config.size) },
+        terrainHeightMap: { value: null }, // Will be set from terrain system
       },
       vertexShader: waterVertexShader,
       fragmentShader: waterFragmentShader,
@@ -354,7 +534,7 @@ export class WaterSystem {
       side: THREE.DoubleSide,
       depthWrite: false,
     });
-    
+
     // Create mesh
     this.mesh = new THREE.Mesh(this.geometry, this.material);
     this.mesh.position.y = this.config.seaLevel;
@@ -402,6 +582,15 @@ export class WaterSystem {
    */
   setSunDirection(direction: THREE.Vector3): void {
     this.material.uniforms.sunDirection.value = direction.normalize();
+  }
+
+  /**
+   * Sets the terrain heightmap texture - THIS IS THE KEY!
+   * Water can now "see" the actual terrain
+   */
+  setTerrainHeightmap(texture: THREE.DataTexture, terrainSize: number): void {
+    this.material.uniforms.terrainHeightMap.value = texture;
+    this.material.uniforms.terrainSize.value = new THREE.Vector2(terrainSize, terrainSize);
   }
 
   /**
