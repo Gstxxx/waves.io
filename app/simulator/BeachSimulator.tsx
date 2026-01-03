@@ -187,19 +187,25 @@ function SceneControls({
     });
 
     // Setup interaction between terrain controls and orbit controls
+    // Disable OrbitControls only when actively editing terrain (clicking and dragging on terrain)
+    let isEditingTerrain = false;
+    
     const handlePointerDown = (e: PointerEvent) => {
       // Only disable orbit controls on primary button (left click) without modifiers
       if (e.button === 0 && !e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
+        // Check if we're over terrain - if so, we're editing, disable OrbitControls
         if (orbitControlsRef.current && controls.state.isOverTerrain) {
+          isEditingTerrain = true;
           orbitControlsRef.current.enabled = false;
         }
       }
     };
 
     const handlePointerUp = () => {
-      // Re-enable orbit controls
-      if (orbitControlsRef.current) {
+      // Re-enable orbit controls when done editing
+      if (isEditingTerrain && orbitControlsRef.current) {
         orbitControlsRef.current.enabled = true;
+        isEditingTerrain = false;
       }
     };
 
@@ -331,9 +337,13 @@ function Scene({
         enableZoom={true}
         enableRotate={true}
         mouseButtons={{
-          LEFT: undefined, // Disable left click rotation (used for terrain editing)
-          MIDDLE: 2, // Pan with middle mouse
-          RIGHT: 1, // Rotate with right mouse (or use Ctrl/Shift + left)
+          LEFT: THREE.MOUSE.ROTATE, // Rotate with left mouse (will be disabled when editing terrain)
+          MIDDLE: THREE.MOUSE.PAN, // Pan with middle mouse
+          RIGHT: THREE.MOUSE.ROTATE, // Rotate with right mouse (not zoom!)
+        }}
+        touches={{
+          ONE: THREE.TOUCH.ROTATE, // Rotate with one finger touch
+          TWO: THREE.TOUCH.PAN, // Pan with two finger touch
         }}
         maxPolarAngle={Math.PI / 2.1}
         minDistance={20}
