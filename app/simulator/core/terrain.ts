@@ -68,54 +68,46 @@ export class TerrainSystem {
 
   /**
    * Creates a DataTexture from the heightmap for GPU access
-   * This allows the water shader to read terrain height
+   * Stores height values as world units directly (no normalization)
+   * This allows the water shader to read terrain height directly
    */
   createHeightmapTexture(): THREE.DataTexture {
     const size = this.config.segments + 1;
 
-    // Normalize heightmap values to 0-1 range for texture
-    // We'll store normalized height, then denormalize in shader
-    const minHeight = this.config.minHeight;
-    const maxHeight = this.config.maxHeight;
-    const heightRange = maxHeight - minHeight;
-
+    // Create data array and copy heightmap values directly (world units)
     const data = new Float32Array(size * size);
 
     for (let i = 0; i < this.heightmap.length; i++) {
-      // Normalize to 0-1 range
-      data[i] = (this.heightmap[i] - minHeight) / heightRange;
+      data[i] = this.heightmap[i]; // Store world units directly
     }
 
     const texture = new THREE.DataTexture(
       data,
       size,
       size,
-      THREE.RedFormat,
-      THREE.FloatType
+      THREE.RedFormat, // Single channel (R32F equivalent)
+      THREE.FloatType   // 32-bit float per channel
     );
 
     texture.needsUpdate = true;
     texture.wrapS = THREE.ClampToEdgeWrapping;
     texture.wrapT = THREE.ClampToEdgeWrapping;
-    texture.magFilter = THREE.LinearFilter;
-    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.NearestFilter; // No smoothing
+    texture.minFilter = THREE.NearestFilter;  // No smoothing
 
     return texture;
   }
 
   /**
    * Updates the heightmap texture after terrain modifications
+   * Copies heightmap values directly as world units (no normalization)
    */
   updateHeightmapTexture(): void {
-    const size = this.config.segments + 1;
-    const minHeight = this.config.minHeight;
-    const maxHeight = this.config.maxHeight;
-    const heightRange = maxHeight - minHeight;
-
     const data = this.heightmapTexture.image.data as Float32Array;
 
+    // Copy heightmap values directly to texture data (world units)
     for (let i = 0; i < this.heightmap.length; i++) {
-      data[i] = (this.heightmap[i] - minHeight) / heightRange;
+      data[i] = this.heightmap[i];
     }
 
     this.heightmapTexture.needsUpdate = true;
