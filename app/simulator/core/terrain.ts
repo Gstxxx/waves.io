@@ -13,6 +13,10 @@ export interface TerrainConfig {
   minHeight: number;
   noiseScale: number;
   noiseOctaves: number;
+  // World generation parameters
+  seaLevel?: number; // Sea level in world units (default: 0.0)
+  islandRadius?: number; // Radius where terrain starts to falloff (default: size * 0.4)
+  islandFalloff?: number; // Outer radius where terrain reaches sea level (default: size * 0.5)
 }
 
 export const defaultTerrainConfig: TerrainConfig = {
@@ -344,13 +348,149 @@ export class TerrainSystem {
 
   /**
    * Applies heightmap changes directly
+   * ✅ CRITICAL: This MUST update both heightmap AND geometry positions
    */
   applyHeightmapChanges(changes: Map<number, number>): void {
     const positions = this.geometry.attributes.position.array as Float32Array;
 
+    // Apply changes to heightmap
     changes.forEach((height, index) => {
-      this.heightmap[index] = height;
-      positions[index * 3 + 1] = height;
+      // Clamp to valid range
+      const clampedHeight = Math.max(
+        this.config.minHeight,
+        Math.min(this.config.maxHeight, height)
+      );
+      this.heightmap[index] = clampedHeight;
+      positions[index * 3 + 1] = clampedHeight;
+    });
+
+    // ✅ FORCE UPDATE: Mark as needing update and recompute normals
+    const positionAttr = this.geometry.attributes.position;
+
+    // CRITICAL: Set needsUpdate BEFORE any other operations
+    positionAttr.needsUpdate = true;
+
+    // Force version increment if available (for Three.js internal tracking)
+    if ('version' in positionAttr) {
+      (positionAttr as any).version++;
+    }
+
+    // AGGRESSIVE: Force Three.js to recognize the change by re-setting the attribute
+    // This ensures the renderer sees the update even if needsUpdate wasn't enough
+    this.geometry.setAttribute('position', positionAttr);
+
+    // Force geometry version increment
+    if ('version' in this.geometry) {
+      (this.geometry as any).version++;
+    }
+
+    // Recompute normals (this also helps trigger updates)
+    this.geometry.computeVertexNormals();
+
+    // Force mesh matrix update
+    this.mesh.updateMatrix();
+    this.mesh.updateMatrixWorld(false);
+
+    // Update heightmap texture for water shader
+    this.updateHeightmapTexture();
+
+    // 🔍 DEBUG: Verify synchronization (with better tolerance for floating point)
+    if (changes.size > 0) {
+      let synced = true;
+      let errorCount = 0;
+      const tolerance = 0.01; // Increased tolerance for floating point precision
+
+      changes.forEach((expectedHeight, index) => {
+        const actualHeight = this.heightmap[index];
+        const positionY = positions[index * 3 + 1];
+
+        // Check if clamped height matches (accounting for clamping)
+        const clampedExpected = Math.max(
+          this.config.minHeight,
+          Math.min(this.config.maxHeight, expectedHeight)
+        );
+
+        if (Math.abs(actualHeight - clampedExpected) > tolerance ||
+          Math.abs(positionY - clampedExpected) > tolerance) {
+          synced = false;
+          errorCount++;
+        }
+      });
+
+      if (!synced && errorCount > changes.size * 0.01) {
+        // Only warn if more than 1% of changes have errors
+        console.warn('⚠️ Heightmap/Geometry sync issue detected!', {
+          errorCount,
+          totalChanges: changes.size,
+          errorPercentage: (errorCount / changes.size * 100).toFixed(2) + '%',
+        });
+      }
+    }
+  }
+
+  /**
+   * Set heightmap value at specific index
+   */
+  setHeightmapValue(index: number, height: number): void {
+    // Clamp height to valid range
+    const clampedHeight = Math.max(
+      this.config.minHeight,
+      Math.min(this.config.maxHeight, height)
+    );
+
+    this.heightmap[index] = clampedHeight;
+    const positions = this.geometry.attributes.position.array as Float32Array;
+    positions[index * 3 + 1] = clampedHeight;
+  }
+
+  /**
+   * Get heightmap grid dimensions
+   */
+  getHeightmapSize(): { width: number; height: number } {
+    const size = this.config.segments + 1;
+    return { width: size, height: size };
+  }
+
+  /**
+   * Convert world coordinates to grid cell index
+   */
+  getCellIndex(x: number, z: number): number | null {
+    const { size, segments } = this.config;
+    const halfSize = size / 2;
+
+    // Convert world coords to grid coords
+    const gridX = ((x + halfSize) / size) * segments;
+    const gridZ = ((z + halfSize) / size) * segments;
+
+    // Clamp to valid range
+    const i = Math.floor(Math.max(0, Math.min(segments, gridZ)));
+    const j = Math.floor(Math.max(0, Math.min(segments, gridX)));
+
+    const index = i * (segments + 1) + j;
+
+    // Validate index
+    if (index >= 0 && index < this.heightmap.length) {
+      return index;
+    }
+
+    return null;
+  }
+
+  /**
+   * Batch update heightmap efficiently (for erosion system)
+   */
+  batchUpdateHeightmap(changes: Map<number, number>): void {
+    const positions = this.geometry.attributes.position.array as Float32Array;
+
+    changes.forEach((height, index) => {
+      // Clamp height to valid range
+      const clampedHeight = Math.max(
+        this.config.minHeight,
+        Math.min(this.config.maxHeight, height)
+      );
+
+      this.heightmap[index] = clampedHeight;
+      positions[index * 3 + 1] = clampedHeight;
     });
 
     this.geometry.attributes.position.needsUpdate = true;

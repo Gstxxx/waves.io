@@ -24,6 +24,7 @@ export class TerrainControls {
   public state: ControlsState;
   public brushConfig: BrushConfig;
   public brushIndicator: THREE.Mesh;
+  public enabled: boolean = true; // Enable/disable terrain editing
   
   private onBrushApplied?: () => void;
 
@@ -111,6 +112,13 @@ export class TerrainControls {
    * Handles pointer movement
    */
   private handlePointerMove(event: PointerEvent): void {
+    // Don't process if disabled
+    if (!this.enabled) {
+      this.state.isOverTerrain = false;
+      this.brushIndicator.visible = false;
+      return;
+    }
+    
     const rect = this.domElement.getBoundingClientRect();
     this.state.pointerPosition.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     this.state.pointerPosition.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
@@ -127,6 +135,9 @@ export class TerrainControls {
    * Handles pointer down
    */
   private handlePointerDown(event: PointerEvent): void {
+    // Don't process if disabled
+    if (!this.enabled) return;
+    
     // Only respond to left click (primary button)
     if (event.button !== 0) return;
     
