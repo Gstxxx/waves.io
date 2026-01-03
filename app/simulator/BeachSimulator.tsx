@@ -15,7 +15,8 @@ import { TerrainSystem, defaultTerrainConfig } from './core/terrain';
 import { WaterSystem, defaultWaterConfig } from './core/water';
 import { VegetationSystem, defaultVegetationConfig } from './core/vegetation';
 import { TerrainControls } from './core/controls';
-import { BrushType, defaultBrushConfig } from './core/brushes';
+import { BrushType, BrushShape, defaultBrushConfig } from './core/brushes';
+import { ErosionSystem, defaultErosionConfig } from './core/erosion';
 
 // Terrain Component
 function Terrain({
@@ -164,15 +165,23 @@ function SceneControls({
   brushRadius,
   brushStrength,
   brushType,
+  brushShape,
+  brushAspectRatio,
+  brushRotation,
   controlsRef,
   orbitControlsRef,
+  erosionRef,
 }: {
   terrainRef: React.MutableRefObject<TerrainSystem | null>;
   brushRadius: number;
   brushStrength: number;
   brushType: BrushType;
+  brushShape: BrushShape;
+  brushAspectRatio: number;
+  brushRotation: number;
   controlsRef: React.MutableRefObject<TerrainControls | null>;
   orbitControlsRef: React.MutableRefObject<any>;
+  erosionRef: React.MutableRefObject<ErosionSystem | null>;
 }) {
   const { camera, gl } = useThree();
 
@@ -184,7 +193,10 @@ function SceneControls({
       radius: brushRadius,
       strength: brushStrength,
       type: brushType,
-    });
+      shape: brushShape,
+      aspectRatio: brushAspectRatio,
+      rotation: brushRotation,
+    }, erosionRef.current);
 
     // Setup interaction between terrain controls and orbit controls
     // Disable OrbitControls only when actively editing terrain (clicking and dragging on terrain)
@@ -229,9 +241,12 @@ function SceneControls({
         radius: brushRadius,
         strength: brushStrength,
         type: brushType,
+        shape: brushShape,
+        aspectRatio: brushAspectRatio,
+        rotation: brushRotation,
       });
     }
-  }, [brushRadius, brushStrength, brushType, controlsRef]);
+  }, [brushRadius, brushStrength, brushType, brushShape, brushAspectRatio, brushRotation, controlsRef]);
 
   return null;
 }
@@ -266,6 +281,93 @@ function Lighting({ sunPosition }: { sunPosition: [number, number, number] }) {
   );
 }
 
+// Erosion Component
+function Erosion({
+  terrainRef,
+  erosionRef,
+  enabled,
+  intensity,
+  waterAmount,
+  evaporationRate,
+  sedimentCapacity,
+  erosionRate,
+  depositionRate,
+  minSlope,
+  gravity,
+  iterations,
+  dropRadius,
+  timeScale,
+}: {
+  terrainRef: React.MutableRefObject<TerrainSystem | null>;
+  erosionRef: React.MutableRefObject<ErosionSystem | null>;
+  enabled: boolean;
+  intensity: number;
+  waterAmount: number;
+  evaporationRate: number;
+  sedimentCapacity: number;
+  erosionRate: number;
+  depositionRate: number;
+  minSlope: number;
+  gravity: number;
+  iterations: number;
+  dropRadius: number;
+  timeScale: number;
+}) {
+  const erosion = useMemo(() => {
+    const terrain = terrainRef.current;
+    if (!terrain) return null;
+    
+    return new ErosionSystem(terrain, {
+      enabled,
+      intensity,
+      waterAmount,
+      evaporationRate,
+      sedimentCapacity,
+      erosionRate,
+      depositionRate,
+      minSlope,
+      gravity,
+      iterations,
+      dropRadius,
+    });
+  }, [terrainRef]);
+
+  useEffect(() => {
+    erosionRef.current = erosion;
+    return () => {
+      if (erosion) {
+        erosion.dispose();
+      }
+    };
+  }, [erosion, erosionRef]);
+
+  useEffect(() => {
+    if (erosion) {
+      erosion.updateConfig({
+        enabled,
+        intensity,
+        waterAmount,
+        evaporationRate,
+        sedimentCapacity,
+        erosionRate,
+        depositionRate,
+        minSlope,
+        gravity,
+        iterations,
+        dropRadius,
+      });
+    }
+  }, [erosion, enabled, intensity, waterAmount, evaporationRate, sedimentCapacity, erosionRate, depositionRate, minSlope, gravity, iterations, dropRadius]);
+
+  useFrame((_, delta) => {
+    if (erosion) {
+      erosion.update(delta * timeScale);
+    }
+  });
+
+  return null;
+}
+
 // Main Scene Component
 function Scene({
   seaLevel,
@@ -274,12 +376,26 @@ function Scene({
   brushRadius,
   brushStrength,
   brushType,
+  brushShape,
+  brushAspectRatio,
+  brushRotation,
   sandColor,
   shallowColor,
   deepColor,
   timeScale,
   sunAzimuth,
   sunElevation,
+  erosionEnabled,
+  erosionIntensity,
+  erosionWaterAmount,
+  erosionEvaporationRate,
+  erosionSedimentCapacity,
+  erosionRate,
+  erosionDepositionRate,
+  erosionMinSlope,
+  erosionGravity,
+  erosionIterations,
+  erosionDropRadius,
 }: {
   seaLevel: number;
   waveIntensity: number;
@@ -287,17 +403,32 @@ function Scene({
   brushRadius: number;
   brushStrength: number;
   brushType: BrushType;
+  brushShape: BrushShape;
+  brushAspectRatio: number;
+  brushRotation: number;
   sandColor: string;
   shallowColor: string;
   deepColor: string;
   timeScale: number;
   sunAzimuth: number;
   sunElevation: number;
+  erosionEnabled: boolean;
+  erosionIntensity: number;
+  erosionWaterAmount: number;
+  erosionEvaporationRate: number;
+  erosionSedimentCapacity: number;
+  erosionRate: number;
+  erosionDepositionRate: number;
+  erosionMinSlope: number;
+  erosionGravity: number;
+  erosionIterations: number;
+  erosionDropRadius: number;
 }) {
   const terrainRef = useRef<TerrainSystem | null>(null);
   const waterRef = useRef<WaterSystem | null>(null);
   const controlsRef = useRef<TerrainControls | null>(null);
   const orbitControlsRef = useRef<any>(null);
+  const erosionRef = useRef<ErosionSystem | null>(null);
 
   // Calculate sun position from azimuth and elevation
   const sunPosition: [number, number, number] = useMemo(() => {
@@ -373,14 +504,36 @@ function Scene({
       {/* Vegetation */}
       <Vegetation terrain={terrainRef.current} seaLevel={seaLevel} />
 
+      {/* Erosion System */}
+      <Erosion
+        terrainRef={terrainRef}
+        erosionRef={erosionRef}
+        enabled={erosionEnabled}
+        intensity={erosionIntensity}
+        waterAmount={erosionWaterAmount}
+        evaporationRate={erosionEvaporationRate}
+        sedimentCapacity={erosionSedimentCapacity}
+        erosionRate={erosionRate}
+        depositionRate={erosionDepositionRate}
+        minSlope={erosionMinSlope}
+        gravity={erosionGravity}
+        iterations={erosionIterations}
+        dropRadius={erosionDropRadius}
+        timeScale={timeScale}
+      />
+
       {/* Terrain Controls */}
       <SceneControls
         terrainRef={terrainRef}
         brushRadius={brushRadius}
         brushStrength={brushStrength}
         brushType={brushType}
+        brushShape={brushShape}
+        brushAspectRatio={brushAspectRatio}
+        brushRotation={brushRotation}
         controlsRef={controlsRef}
         orbitControlsRef={orbitControlsRef}
+        erosionRef={erosionRef}
       />
 
       {/* Brush Indicator */}
@@ -408,13 +561,22 @@ export default function BeachSimulator() {
     brushRadius,
     brushStrength,
     brushType,
+    brushShape,
+    brushAspectRatio,
+    brushRotation,
   } = useControls('Brush', {
     brushType: {
       value: 'raise' as BrushType,
       options: ['raise', 'lower', 'smooth', 'flatten', 'erosion'] as BrushType[],
     },
+    brushShape: {
+      value: 'circle' as BrushShape,
+      options: ['circle', 'square', 'diamond', 'star', 'line', 'ellipse'] as BrushShape[],
+    },
     brushRadius: { value: 10, min: 1, max: 50, step: 1 },
     brushStrength: { value: 0.5, min: 0.1, max: 2, step: 0.1 },
+    brushAspectRatio: { value: 1.0, min: 0.1, max: 5, step: 0.1, label: 'Aspect Ratio' },
+    brushRotation: { value: 0, min: 0, max: 360, step: 1, label: 'Rotation (degrees)' },
   });
 
   const {
@@ -433,6 +595,32 @@ export default function BeachSimulator() {
   } = useControls('Sun', {
     sunAzimuth: { value: 180, min: 0, max: 360, step: 1 },
     sunElevation: { value: 45, min: 5, max: 90, step: 1 },
+  });
+
+  const {
+    erosionEnabled,
+    erosionIntensity,
+    erosionWaterAmount,
+    erosionEvaporationRate,
+    erosionSedimentCapacity,
+    erosionRate,
+    erosionDepositionRate,
+    erosionMinSlope,
+    erosionGravity,
+    erosionIterations,
+    erosionDropRadius,
+  } = useControls('Erosion', {
+    erosionEnabled: { value: false, label: 'Enabled' },
+    erosionIntensity: { value: 0.5, min: 0, max: 1, step: 0.01, label: 'Intensity' },
+    erosionWaterAmount: { value: 0.3, min: 0, max: 1, step: 0.01, label: 'Water Amount' },
+    erosionEvaporationRate: { value: 0.01, min: 0, max: 0.1, step: 0.001, label: 'Evaporation' },
+    erosionSedimentCapacity: { value: 0.1, min: 0, max: 1, step: 0.01, label: 'Sediment Capacity' },
+    erosionRate: { value: 0.3, min: 0, max: 1, step: 0.01, label: 'Erosion Rate' },
+    erosionDepositionRate: { value: 0.3, min: 0, max: 1, step: 0.01, label: 'Deposition Rate' },
+    erosionMinSlope: { value: 0.01, min: 0, max: 0.1, step: 0.001, label: 'Min Slope' },
+    erosionGravity: { value: 9.8, min: 1, max: 20, step: 0.1, label: 'Gravity' },
+    erosionIterations: { value: 10, min: 1, max: 50, step: 1, label: 'Iterations/Frame' },
+    erosionDropRadius: { value: 1.0, min: 0.1, max: 5, step: 0.1, label: 'Drop Radius' },
   });
 
   return (
@@ -459,12 +647,26 @@ export default function BeachSimulator() {
           brushRadius={brushRadius}
           brushStrength={brushStrength}
           brushType={brushType as BrushType}
+          brushShape={brushShape as BrushShape}
+          brushAspectRatio={brushAspectRatio}
+          brushRotation={(brushRotation * Math.PI) / 180}
           sandColor={sandColor}
           shallowColor={shallowColor}
           deepColor={deepColor}
           timeScale={timeScale}
           sunAzimuth={sunAzimuth}
           sunElevation={sunElevation}
+          erosionEnabled={erosionEnabled}
+          erosionIntensity={erosionIntensity}
+          erosionWaterAmount={erosionWaterAmount}
+          erosionEvaporationRate={erosionEvaporationRate}
+          erosionSedimentCapacity={erosionSedimentCapacity}
+          erosionRate={erosionRate}
+          erosionDepositionRate={erosionDepositionRate}
+          erosionMinSlope={erosionMinSlope}
+          erosionGravity={erosionGravity}
+          erosionIterations={erosionIterations}
+          erosionDropRadius={erosionDropRadius}
         />
       </Canvas>
 

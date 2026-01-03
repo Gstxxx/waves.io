@@ -6,17 +6,24 @@
 import { TerrainSystem } from './terrain';
 
 export type BrushType = 'raise' | 'lower' | 'smooth' | 'flatten' | 'erosion';
+export type BrushShape = 'circle' | 'square' | 'diamond' | 'star' | 'line' | 'ellipse';
 
 export interface BrushConfig {
   radius: number;
   strength: number;
   type: BrushType;
+  shape: BrushShape;
+  aspectRatio?: number; // For ellipse (width/height ratio)
+  rotation?: number; // Rotation angle in radians (for line, ellipse, star)
 }
 
 export const defaultBrushConfig: BrushConfig = {
   radius: 10,
   strength: 0.5,
   type: 'raise',
+  shape: 'circle',
+  aspectRatio: 1.0,
+  rotation: 0,
 };
 
 /**
@@ -44,6 +51,79 @@ export function gaussianFalloff(distance: number, radius: number): number {
 }
 
 /**
+ * Calculates distance from point to brush center based on shape
+ * Returns normalized distance (0 = center, 1 = edge, >1 = outside)
+ */
+export function calculateBrushDistance(
+  dx: number,
+  dz: number,
+  shape: BrushShape,
+  radius: number,
+  aspectRatio: number = 1.0,
+  rotation: number = 0
+): number {
+  // Rotate point if needed
+  let px = dx;
+  let pz = dz;
+  if (rotation !== 0) {
+    const cos = Math.cos(-rotation);
+    const sin = Math.sin(-rotation);
+    px = dx * cos - dz * sin;
+    pz = dx * sin + dz * cos;
+  }
+
+  switch (shape) {
+    case 'circle':
+      return Math.sqrt(px * px + pz * pz) / radius;
+
+    case 'square':
+      return Math.max(Math.abs(px), Math.abs(pz)) / radius;
+
+    case 'diamond':
+      return (Math.abs(px) + Math.abs(pz)) / radius;
+
+    case 'star': {
+      // 5-pointed star shape
+      const angle = Math.atan2(pz, px);
+      const distance = Math.sqrt(px * px + pz * pz);
+      const starAngle = (angle + Math.PI) / (2 * Math.PI) * 5;
+      const starRadius = radius * (0.5 + 0.5 * Math.cos(starAngle * Math.PI * 2));
+      return distance / starRadius;
+    }
+
+    case 'line': {
+      // Line brush - only affects points along one axis
+      const perpDistance = Math.abs(pz); // Distance perpendicular to line
+      return perpDistance / (radius * 0.1); // Very thin line
+    }
+
+    case 'ellipse': {
+      // Ellipse with aspect ratio
+      const rx = radius * Math.max(1, aspectRatio);
+      const rz = radius * Math.max(1, 1 / aspectRatio);
+      return Math.sqrt((px / rx) ** 2 + (pz / rz) ** 2);
+    }
+
+    default:
+      return Math.sqrt(px * px + pz * pz) / radius;
+  }
+}
+
+/**
+ * Checks if a point is inside the brush shape
+ */
+export function isPointInBrush(
+  dx: number,
+  dz: number,
+  shape: BrushShape,
+  radius: number,
+  aspectRatio: number = 1.0,
+  rotation: number = 0
+): boolean {
+  return calculateBrushDistance(dx, dz, shape, radius, aspectRatio, rotation) <= 1.0;
+}
+
+/**
  * Applies the raise brush - increases terrain height
  */
 export function applyRaiseBrush(
@@ -52,12 +132,30 @@ export function applyRaiseBrush(
   z: number,
   config: BrushConfig
 ): void {
-  terrain.modifyHeight(
-    x, z,
-    config.radius,
-    config.strength,
-    cosineFalloff
-  );
+  // Use shape-aware modification
+  const { indices, heights, positions } = terrain.getHeightmapRegion(x, z, config.radius);
+  const changes = new Map<number, number>();
+
+  for (let i = 0; i < indices.length; i++) {
+    const pos = positions[i];
+    const dx = pos.x - x;
+    const dz = pos.z - z;
+    const distance = calculateBrushDistance(
+      dx,
+      dz,
+      config.shape,
+      config.radius,
+      config.aspectRatio,
+      config.rotation
+    );
+
+    if (distance <= 1.0) {
+      const factor = cosineFalloff(distance * config.radius, config.radius) * config.strength;
+      changes.set(indices[i], heights[i] + factor);
+    }
+  }
+
+  terrain.applyHeightmapChanges(changes);
 }
 
 /**
@@ -69,12 +167,30 @@ export function applyLowerBrush(
   z: number,
   config: BrushConfig
 ): void {
-  terrain.modifyHeight(
-    x, z,
-    config.radius,
-    -config.strength,
-    cosineFalloff
-  );
+  // Use shape-aware modification
+  const { indices, heights, positions } = terrain.getHeightmapRegion(x, z, config.radius);
+  const changes = new Map<number, number>();
+
+  for (let i = 0; i < indices.length; i++) {
+    const pos = positions[i];
+    const dx = pos.x - x;
+    const dz = pos.z - z;
+    const distance = calculateBrushDistance(
+      dx,
+      dz,
+      config.shape,
+      config.radius,
+      config.aspectRatio,
+      config.rotation
+    );
+
+    if (distance <= 1.0) {
+      const factor = cosineFalloff(distance * config.radius, config.radius) * config.strength;
+      changes.set(indices[i], heights[i] - factor);
+    }
+  }
+
+  terrain.applyHeightmapChanges(changes);
 }
 
 /**
@@ -94,9 +210,16 @@ export function applySmoothBrush(
     const pos = positions[i];
     const dx = pos.x - x;
     const dz = pos.z - z;
-    const distance = Math.sqrt(dx * dx + dz * dz);
+    const distance = calculateBrushDistance(
+      dx,
+      dz,
+      config.shape,
+      config.radius,
+      config.aspectRatio,
+      config.rotation
+    );
     
-    if (distance > config.radius) continue;
+    if (distance > 1.0) continue;
     
     // Find neighbors and calculate average
     let sum = 0;
@@ -118,7 +241,7 @@ export function applySmoothBrush(
     
     if (count > 0) {
       const avgHeight = sum / count;
-      const factor = cosineFalloff(distance, config.radius) * config.strength;
+      const factor = cosineFalloff(distance * config.radius, config.radius) * config.strength;
       const newHeight = heights[i] + (avgHeight - heights[i]) * factor;
       changes.set(indices[i], newHeight);
     }
@@ -163,11 +286,18 @@ export function applyFlattenBrush(
     const pos = positions[i];
     const dx = pos.x - x;
     const dz = pos.z - z;
-    const distance = Math.sqrt(dx * dx + dz * dz);
+    const distance = calculateBrushDistance(
+      dx,
+      dz,
+      config.shape,
+      config.radius,
+      config.aspectRatio,
+      config.rotation
+    );
     
-    if (distance > config.radius) continue;
+    if (distance > 1.0) continue;
     
-    const factor = cosineFalloff(distance, config.radius) * config.strength;
+    const factor = cosineFalloff(distance * config.radius, config.radius) * config.strength;
     const newHeight = heights[i] + (targetHeight - heights[i]) * factor;
     changes.set(indices[i], newHeight);
   }
@@ -176,14 +306,23 @@ export function applyFlattenBrush(
 }
 
 /**
- * Applies the erosion brush - simulates erosion via blur + slope detection
+ * Applies the erosion brush - uses hydraulic erosion system
+ * Note: This requires an ErosionSystem instance to be passed
  */
 export function applyErosionBrush(
   terrain: TerrainSystem,
   x: number,
   z: number,
-  config: BrushConfig
+  config: BrushConfig,
+  erosionSystem?: any // ErosionSystem instance (optional for backward compatibility)
 ): void {
+  // If erosion system is provided, use it for better results
+  if (erosionSystem && typeof erosionSystem.applyErosionAt === 'function') {
+    erosionSystem.applyErosionAt(x, z, config.radius, config.strength);
+    return;
+  }
+
+  // Fallback to simple erosion if no system provided
   const { indices, heights, positions } = terrain.getHeightmapRegion(x, z, config.radius);
   const changes = new Map<number, number>();
   
@@ -200,9 +339,16 @@ export function applyErosionBrush(
       const pos = positions[i];
       const dx = pos.x - x;
       const dz = pos.z - z;
-      const distance = Math.sqrt(dx * dx + dz * dz);
+      const distance = calculateBrushDistance(
+        dx,
+        dz,
+        config.shape,
+        config.radius,
+        config.aspectRatio,
+        config.rotation
+      );
       
-      if (distance > config.radius) continue;
+      if (distance > 1.0) continue;
       
       // Calculate local slope
       let maxSlope = 0;
@@ -228,12 +374,9 @@ export function applyErosionBrush(
       
       // Erode based on slope
       if (maxSlope > 0.1) {
-        const factor = cosineFalloff(distance, config.radius) * erosionStrength;
+        const factor = cosineFalloff(distance * config.radius, config.radius) * erosionStrength;
         const erosionAmount = maxSlope * factor;
         newHeights[i] = currentHeights[i] - erosionAmount;
-        
-        // Deposit at lower neighbor (simplified)
-        // This is a fake erosion - real erosion would track sediment
       }
     }
     
@@ -245,9 +388,16 @@ export function applyErosionBrush(
     const pos = positions[i];
     const dx = pos.x - x;
     const dz = pos.z - z;
-    const distance = Math.sqrt(dx * dx + dz * dz);
+    const distance = calculateBrushDistance(
+      dx,
+      dz,
+      config.shape,
+      config.radius,
+      config.aspectRatio,
+      config.rotation
+    );
     
-    if (distance <= config.radius) {
+    if (distance <= 1.0) {
       changes.set(indices[i], currentHeights[i]);
     }
   }
@@ -262,7 +412,8 @@ export function applyBrush(
   terrain: TerrainSystem,
   x: number,
   z: number,
-  config: BrushConfig
+  config: BrushConfig,
+  erosionSystem?: any
 ): void {
   switch (config.type) {
     case 'raise':
@@ -278,7 +429,7 @@ export function applyBrush(
       applyFlattenBrush(terrain, x, z, config);
       break;
     case 'erosion':
-      applyErosionBrush(terrain, x, z, config);
+      applyErosionBrush(terrain, x, z, config, erosionSystem);
       break;
   }
 }
@@ -300,6 +451,7 @@ export function getBrushAffectedArea(
     const dz = pos.z - z;
     const distance = Math.sqrt(dx * dx + dz * dz);
     
+    // Default to circle shape for visualization
     if (distance <= radius) {
       affected.push({
         x: pos.x,
